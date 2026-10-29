@@ -17,7 +17,6 @@ import (
 	xrayCore "github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/inbound"
 	"github.com/xtls/xray-core/features/stats"
-	featurebandwidth "github.com/xtls/xray-core/features/bandwidth"
 	"github.com/xtls/xray-core/infra/conf/serial"
 	xrayProxy "github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/proxy/shadowsocks"
@@ -29,11 +28,11 @@ import (
 
 	_ "github.com/xtls/xray-core/main/distro/all"
 
-	"github.com/cedar2025/xboard-node/internal/config"
-	"github.com/cedar2025/xboard-node/internal/kernel"
-	"github.com/cedar2025/xboard-node/internal/kernel/geodata"
-	"github.com/cedar2025/xboard-node/internal/nlog"
-	"github.com/cedar2025/xboard-node/internal/model"
+	"github.com/kirakirai8023/Xboard-Node/internal/config"
+	"github.com/kirakirai8023/Xboard-Node/internal/kernel"
+	"github.com/kirakirai8023/Xboard-Node/internal/kernel/geodata"
+	"github.com/kirakirai8023/Xboard-Node/internal/model"
+	"github.com/kirakirai8023/Xboard-Node/internal/nlog"
 )
 
 const (
@@ -255,7 +254,7 @@ func (x *Xray) CloseUserConnections(_ context.Context, _ string) error {
 	return nil
 }
 
-// SetSpeedLimitFunc wires xray's patched bandwidth feature to the shared
+// SetSpeedLimitFunc wires the dispatcher to the shared
 // per-user limiter callback used by the service layer. Unlike the old no-op
 // behavior, xray now consumes this callback to support dynamic speed updates.
 func (x *Xray) SetSpeedLimitFunc(fn func(string) *rate.Limiter) {
@@ -314,7 +313,7 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 		x.users = merged
 		x.mu.Unlock()
 		x.updateDispatcherLimits(merged)
-	x.updateBandwidthLimits(merged)
+		x.updateBandwidthLimits(merged)
 		return 0, nil
 	}
 
@@ -572,7 +571,11 @@ func toMemoryUser(proto string, nc *model.NodeSpec, u model.UserSpec) (*protocol
 	case "shadowsocks":
 		if strings.HasPrefix(nc.Cipher, "2022-blake3-") {
 			// 2022-blake3 multi-user mode
-			mu.Account = &ss2022.MemoryAccount{Key: u.UUID}
+			method, ok := ss2022Methods[nc.Cipher]
+			if !ok {
+				return nil, fmt.Errorf("unsupported ss2022 cipher %q", nc.Cipher)
+			}
+			mu.Account = &ss2022.MemoryAccount{Key: ss2022UserKey(method.size, u.UUID)}
 		} else {
 			// Traditional SS — build via getCipher path
 			ct := parseCipherType(nc.Cipher)
@@ -602,9 +605,9 @@ func parseCipherType(cipher string) shadowsocks.CipherType {
 	case "xchacha20-ietf-poly1305", "xchacha20-poly1305":
 		return shadowsocks.CipherType_XCHACHA20_POLY1305
 	case "none", "plain":
-		return shadowsocks.CipherType_NONE
+		return shadowsocks.CipherType_UNKNOWN
 	default:
-		return shadowsocks.CipherType_AES_256_GCM
+		return shadowsocks.CipherType_UNKNOWN
 	}
 }
 
@@ -742,43 +745,36 @@ func (x *Xray) aggregateStats() (map[int][2]int64, error) {
 	return traffic, nil
 }
 
-// updateBandwidthLimits configures the patched xray-core bandwidth feature
-// with per-user speed limits in bytes per second.
+// updateBandwidthLimits connects the local dispatcher to the shared limiters.
 func (x *Xray) updateBandwidthLimits(users []model.UserSpec) {
 	x.mu.Lock()
-	inst := x.instance
-	fn := x.speedLimitFunc
-	currentUsers := x.users
+	ld, fn, currentUsers := x.limitDispatcher, x.speedLimitFunc, x.users
 	x.mu.Unlock()
-	if inst == nil {
+	if ld == nil {
 		return
 	}
-	feat := inst.GetFeature(featurebandwidth.ManagerType())
-	if feat == nil {
-		return
-	}
-	bm, ok := feat.(featurebandwidth.Manager)
-	if !ok {
-		return
-	}
-	bm.Reset()
 	if users == nil {
 		users = currentUsers
 	}
+	limits := make(map[string]*rate.Limiter, len(users)*2)
 	for _, u := range users {
-		email := userEmail(u.ID)
+		var lim *rate.Limiter
 		if fn != nil {
-			bm.SetUserLimiter(email, fn(u.UUID))
-			continue
+			lim = fn(u.UUID)
+		} else if u.SpeedLimit > 0 {
+			bps := int64(u.SpeedLimit) * 1_000_000 / 8
+			lim = rate.NewLimiter(rate.Limit(bps), max(64*1024, int(bps)))
 		}
-		bps := int64(u.SpeedLimit) * 1_000_000 / 8
-		bm.SetUserLimit(email, bps)
+		limits[userEmail(u.ID)] = lim
+		limits[u.UUID] = lim
 	}
+	ld.mu.Lock()
+	ld.speedLimits = limits
+	ld.mu.Unlock()
 }
 
 // updateDispatcherLimits configures the LimitDispatcher with per-user
-// device-limit admission metadata only. Speed limits are enforced by the
-// patched xray-core bandwidth feature.
+// device-limit admission metadata. Speed limits use the local dispatcher.
 func (x *Xray) updateDispatcherLimits(users []model.UserSpec) {
 	x.mu.Lock()
 	ld := x.limitDispatcher

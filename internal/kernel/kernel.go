@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/cedar2025/xboard-node/internal/model"
+	"github.com/kirakirai8023/Xboard-Node/internal/model"
 	"golang.org/x/time/rate"
 )
 
@@ -36,9 +36,9 @@ func (t TLSCert) HasCert() bool {
 // Kernel is the interface for proxy kernel backends (sing-box, xray, etc.).
 //
 // The interface is split into lifecycle, user management, and observability
-// groups. User operations (AddUsers/RemoveUsers) are designed to be atomic
-// and non-disruptive — they MUST NOT restart listeners or drop existing
-// connections. Only Start and Reload may (re)bind ports.
+// groups. User operations (AddUsers/RemoveUsers) are incremental where the
+// backend supports it. Official sing-box requires instance replacement for
+// credential changes; limit-only changes stay live.
 //
 // Implementors: singbox.SingBox, xray.Xray
 type Kernel interface {
@@ -55,7 +55,7 @@ type Kernel interface {
 	// user set, binds listeners, and begins accepting connections.
 	// Calling Start on an already-running kernel stops the old instance first.
 	Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls TLSCert) error
-	// Stop gracefully shuts down the kernel, draining active connections.
+	// Stop shuts down the kernel and releases owned resources.
 	Stop()
 	// IsRunning returns whether the kernel is currently accepting connections.
 	IsRunning() bool
@@ -64,9 +64,9 @@ type Kernel interface {
 	// Existing connections MAY be briefly interrupted.
 	Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls TLSCert) error
 
-	// ─── User management (non-disruptive) ───────────────────────────────
+	// ─── User management ───────────────────────────────────────────────
 	// AddUsers registers new users with the running kernel.
-	// Existing connections are unaffected. Returns the count actually added
+	// A backend may replace listeners. Returns the count actually added
 	// (duplicates are silently skipped).
 	AddUsers(users []model.UserSpec) (added int, err error)
 	// RemoveUsers deregisters users from the running kernel.

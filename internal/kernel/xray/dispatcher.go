@@ -16,8 +16,10 @@ import (
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/transport"
+	"github.com/xtls/xray-core/transport/pipe"
+	"golang.org/x/time/rate"
 
-	"github.com/cedar2025/xboard-node/internal/nlog"
+	"github.com/kirakirai8023/Xboard-Node/internal/nlog"
 )
 
 // Access xray's internal config creator registry so we can replace the
@@ -61,10 +63,8 @@ func limitDispatcherFactory(ctx context.Context, config interface{}) (interface{
 // LimitDispatcher wraps xray's DefaultDispatcher to enforce per-user
 // admission checks before a request is dispatched into xray-core.
 //
-// It intentionally does NOT mutate transport.Link.Reader/Writer. Xray's
-// mux/XUDP close path requires the original concrete *pipe.Reader to remain
-// intact, so the dispatcher is limited to gate-keeping and safe connection
-// lifecycle bookkeeping.
+// Links returned to inbounds retain concrete pipe readers for mux/XUDP.
+// Rate limiting wraps writers, or a private copy of a DispatchLink link.
 type LimitDispatcher struct {
 	inner     interface{}        // original DefaultDispatcher (Feature + Dispatcher)
 	innerDisp routing.Dispatcher // same object, typed as Dispatcher
@@ -75,6 +75,7 @@ type LimitDispatcher struct {
 	limitedIPs   map[string]map[string]int // email → sourceIP → refcount
 	deviceLimits map[string]int            // email → max devices
 	emailToUID   map[string]int            // email → panel user ID
+	speedLimits  map[string]*rate.Limiter  // email/UUID → shared limiter
 
 	// unlimitedIPs: users without device limit — sync.Map for lock-free access.
 	// Each entry is *ipCounter{ips sync.Map}.
@@ -103,35 +104,85 @@ func (ic *ipCounter) aliveIPs() map[string]bool {
 // ─── routing.Dispatcher ──────────────────────────────────────────────────────
 
 func (d *LimitDispatcher) Dispatch(ctx context.Context, dest net.Destination) (*transport.Link, error) {
+	if !dest.IsValid() {
+		return nil, errors.New("invalid destination")
+	}
+	ctx = d.canonicalUserContext(ctx)
 	email, sourceIP, isTCP, err := d.identifyAndCheck(ctx, dest)
 	if err != nil {
 		return nil, err
 	}
+	if email == "" {
+		return d.innerDisp.Dispatch(ctx, dest)
+	}
 
-	link, err := d.innerDisp.Dispatch(ctx, dest)
-	if err != nil {
-		if email != "" && isTCP {
-			d.delConn(email, sourceIP)
+	// Own both pipe ends so both directions can be throttled at writes,
+	// without changing the concrete reader returned to mux/XUDP callers.
+	options := pipe.OptionsFromContext(ctx)
+	upReader, upWriter := pipe.New(options...)
+	downReader, downWriter := pipe.New(options...)
+	link := &transport.Link{
+		Reader: downReader,
+		Writer: d.limitWriter(ctx, email, upWriter),
+	}
+	d.trackLink(link, email, sourceIP, isTCP)
+	outbound := &transport.Link{
+		Reader: upReader,
+		Writer: d.limitWriter(ctx, email, downWriter),
+	}
+	go func() {
+		if err := d.innerDisp.DispatchLink(ctx, dest, outbound); err != nil {
+			common.Interrupt(link.Writer)
+			common.Interrupt(outbound.Writer)
+			common.Interrupt(upReader)
+			common.Interrupt(downReader)
 		}
-		return nil, err
-	}
-
-	if email != "" {
-		d.trackLink(link, email, sourceIP, isTCP)
-	}
+	}()
 	return link, nil
 }
 
 func (d *LimitDispatcher) DispatchLink(ctx context.Context, dest net.Destination, link *transport.Link) error {
+	ctx = d.canonicalUserContext(ctx)
 	email, sourceIP, isTCP, err := d.identifyAndCheck(ctx, dest)
 	if err != nil {
 		return err
 	}
-
-	if email != "" {
-		d.trackLink(link, email, sourceIP, isTCP)
+	if email == "" {
+		return d.innerDisp.DispatchLink(ctx, dest, link)
 	}
-	return d.innerDisp.DispatchLink(ctx, dest, link)
+	d.trackLink(link, email, sourceIP, isTCP)
+	// Do not replace the caller's reader: mux owns its concrete pipe type.
+	limited := &transport.Link{
+		Reader: &bandwidthReader{Reader: link.Reader, ctx: ctx, limiter: func() *rate.Limiter { return d.speedLimiter(email) }},
+		Writer: d.limitWriter(ctx, email, link.Writer),
+	}
+	err = d.innerDisp.DispatchLink(ctx, dest, limited)
+	if err != nil {
+		common.Interrupt(limited.Writer)
+	}
+	return err
+}
+
+// canonicalUserContext maps upstream SOCKS/HTTP usernames to the same email
+// used by traffic polling and limits, without mutating a shared session user.
+func (d *LimitDispatcher) canonicalUserContext(ctx context.Context) context.Context {
+	inbound := session.InboundFromContext(ctx)
+	if inbound == nil || inbound.User == nil {
+		return ctx
+	}
+	d.mu.RLock()
+	uid := d.emailToUID[inbound.User.Email]
+	d.mu.RUnlock()
+	if uid == 0 {
+		return ctx
+	}
+	copyInbound, copyUser := *inbound, *inbound.User
+	copyUser.Email = userEmail(uid)
+	copyInbound.User = &copyUser
+	// Kernel splice bypasses buf.Reader/Writer wrappers on Linux. Keep
+	// managed users on the accounting/limiting path, including live updates.
+	copyInbound.CanSpliceCopy = 3
+	return session.ContextWithInbound(ctx, &copyInbound)
 }
 
 // identifyAndCheck extracts user identity from the session context, enforces

@@ -10,12 +10,13 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	tun "github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common/buf"
 	singM "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"golang.org/x/time/rate"
 
-	"github.com/cedar2025/xboard-node/internal/nlog"
+	"github.com/kirakirai8023/Xboard-Node/internal/nlog"
 )
 
 // ipPool caches ipSnapshot maps to reduce allocations.
@@ -153,11 +154,19 @@ func NewConnTracker(_ int) *ConnTracker {
 
 // SetSpeedLimitFunc configures the per-user speed limit lookup.
 func (t *ConnTracker) SetSpeedLimitFunc(fn func(uuid string) *rate.Limiter) {
+	if fn == nil {
+		t.speedLimitFunc.Store(nil)
+		return
+	}
 	t.speedLimitFunc.Store(&fn)
 }
 
 // SetDeviceLimitFunc configures the per-user device limit lookup for gate-keeping.
 func (t *ConnTracker) SetDeviceLimitFunc(fn func(uuid string) (int, bool)) {
+	if fn == nil {
+		t.deviceLimitFunc.Store(nil)
+		return
+	}
 	t.deviceLimitFunc.Store(&fn)
 }
 
@@ -201,6 +210,12 @@ func (t *ConnTracker) ClearGlobalDevices() {
 }
 
 // ─── adapter.ConnectionTracker ──────────────────────────────────────────────
+
+// RoutedFlow opts out of TUN flow offload tracking. Node proxy inbounds use
+// RoutedConnection/RoutedPacketConnection for byte and device accounting.
+func (t *ConnTracker) RoutedFlow(context.Context, adapter.InboundContext, adapter.Rule, adapter.Outbound) tun.FlowTracker {
+	return nil
+}
 
 // RoutedConnection wraps a TCP conn to count bytes per-user, track IPs,
 // and optionally rate-limit. Gate-keeps device limits at connection time.

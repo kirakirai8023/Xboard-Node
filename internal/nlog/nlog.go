@@ -35,10 +35,10 @@ var (
 	defaultNode string
 	nodeLoggers = make(map[string]*NodeLog)
 
-	logMu      sync.RWMutex
-	logWriter  io.Writer = os.Stdout
-	logMin     = slog.LevelInfo
-	logColor   = true
+	logMu     sync.RWMutex
+	logWriter io.Writer = os.Stdout
+	logMin              = slog.LevelInfo
+	logColor            = true
 )
 
 // Init configures process-wide log output (called from config.InitLogger).

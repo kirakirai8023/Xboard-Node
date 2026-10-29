@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.26-alpine AS builder
+FROM golang:1.27.1-alpine AS builder
 
 RUN apk add --no-cache git
 
@@ -22,6 +22,8 @@ FROM alpine:3.20
 RUN apk add --no-cache ca-certificates tzdata
 
 COPY --from=builder /build/xboard-node /usr/local/bin/xboard-node
+COPY --from=builder /build/LICENSE.md /usr/share/licenses/xboard-node/LICENSE.md
+COPY --from=builder /build/LICENSES/ /usr/share/licenses/xboard-node/LICENSES/
 
 RUN mkdir -p /etc/xboard-node
 
@@ -33,7 +35,7 @@ WORKDIR /etc/xboard-node
 #     -e apiHost=https://panel.example.com \
 #     -e apiKey=YOUR_TOKEN \
 #     -e nodeID=1 \
-#     ghcr.io/cedar2025/xboard-node:latest
+#     ghcr.io/kirakirai8023/xboard-node:latest
 #
 # Supported env vars:
 #   apiHost  / API_HOST    → panel URL
