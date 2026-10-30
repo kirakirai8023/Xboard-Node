@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Security
+
+- Upgrade `github.com/go-jose/go-jose/v4` from v4.1.4 to v4.1.6 to fix RSA JWK parsing denial of service ([GHSA-mgcc-cww5-fp2q](https://github.com/go-jose/go-jose/security/advisories/GHSA-mgcc-cww5-fp2q)), deeply nested JSON parsing crashes ([GHSA-vvm8-gf78-28g4](https://github.com/go-jose/go-jose/security/advisories/GHSA-vvm8-gf78-28g4)), and CBC-HMAC processing panics ([GHSA-4w3g-jfj2-cw2q](https://github.com/go-jose/go-jose/security/advisories/GHSA-4w3g-jfj2-cw2q)).
+- Upgrade `github.com/cilium/ebpf` from v0.21.0 to v0.22.0 to fix integer overflow in BTF parsing through `LoadCollectionSpecFromReader` ([GHSA-xhgw-qwwf-pg32](https://github.com/advisories/GHSA-xhgw-qwwf-pg32), CVE-2026-10722).
+
 ### Changed
 
 - Require Go 1.27.3 in go.mod, CI, and Docker builds to incorporate the standard-library security fixes through that release.

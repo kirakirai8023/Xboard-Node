@@ -105,6 +105,8 @@ Traffic integration tests use the `integration` build tag and run in a separate 
 
 Dependencies pin official sing-box `v1.14.4` and Xray release commit `0afec66085a85191e9dd2a4a6646c7c9a94688d1`. Go resolves Xray to `v1.260327.1-0.20261029083850-0afec66085a8`; the prefix follows Go module versioning rules. Neither kernel uses a fork replacement.
 
+Security dependency minimums are `github.com/go-jose/go-jose/v4 v4.1.6` (RSA JWK denial of service, JSON parsing crashes, and CBC-HMAC panics) and `github.com/cilium/ebpf v0.22.0` (integer overflow when parsing BTF metadata). Preserve these minimums when updating transitive dependencies; see [CHANGELOG.md](CHANGELOG.md) for the security advisories.
+
 Xray per-user rate limiting uses the local dispatcher and shared token buckets. Managed users have splice disabled so traffic passes through the limiter. `govultr/v3` is pinned to `v3.20.0`, the version supported by `libdns/vultr/v2 v2.0.4`.
 
 ## Fork Releases
