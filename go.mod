@@ -1,6 +1,6 @@
 module github.com/kirakirai8023/Xboard-Node
 
-go 1.27.1
+go 1.27.3
 
 require (
 	github.com/caddyserver/certmagic v0.25.6

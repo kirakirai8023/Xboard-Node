@@ -91,8 +91,7 @@ func (c *Client) Handshake() (*HandshakeResponse, error) {
 	defer drainAndClose(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("handshake status %d: %s", resp.StatusCode, body)
+		return nil, fmt.Errorf("handshake status %d", resp.StatusCode)
 	}
 
 	var hs HandshakeResponse
@@ -227,8 +226,7 @@ func (c *Client) GetConfig() (*NodeConfig, error) {
 		return nil, nil
 	}
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, body)
+		return nil, fmt.Errorf("status %d", resp.StatusCode)
 	}
 
 	var raw map[string]interface{}
@@ -265,8 +263,7 @@ func (c *Client) GetUsers() ([]User, error) {
 		return nil, nil
 	}
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, body)
+		return nil, fmt.Errorf("status %d", resp.StatusCode)
 	}
 
 	var usersResp UsersResponse
@@ -330,8 +327,7 @@ func (c *Client) GetMachineNodes() (*MachineNodesResponse, error) {
 	defer drainAndClose(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("machine nodes status %d: %s", resp.StatusCode, body)
+		return nil, fmt.Errorf("machine nodes status %d", resp.StatusCode)
 	}
 
 	var out MachineNodesResponse
@@ -406,8 +402,7 @@ func (c *Client) postJSON(path string, payload map[string]interface{}) error {
 	defer drainAndClose(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("status %d: %s", resp.StatusCode, respBody)
+		return fmt.Errorf("status %d", resp.StatusCode)
 	}
 	c.apiSuccess.Add(1)
 	return nil
@@ -430,7 +425,7 @@ func (c *Client) doRequest(method, path string, body []byte, ifNoneMatch string)
 
 	req, err := http.NewRequest(method, fullURL, bodyReader)
 	if err != nil {
-		return nil, err
+		return nil, redactURLError(err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -444,7 +439,7 @@ func (c *Client) doRequest(method, path string, body []byte, ifNoneMatch string)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		c.apiFailure.Add(1)
-		return nil, err
+		return nil, redactURLError(err)
 	}
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 400 {
@@ -455,6 +450,15 @@ func (c *Client) doRequest(method, path string, body []byte, ifNoneMatch string)
 
 	nlog.Core().Debug("panel response", "method", method, "path", path, "status", resp.StatusCode)
 	return resp, nil
+}
+
+// URL errors are logged by callers. Authenticated URLs and response bodies
+// must not be included, since tokens can be present even on failed requests.
+func redactURLError(err error) error {
+	if urlErr, ok := err.(*url.Error); ok {
+		return &url.Error{Op: urlErr.Op, URL: "[redacted]", Err: redactURLError(urlErr.Err)}
+	}
+	return err
 }
 
 // drainAndClose reads any remaining bytes (up to 512B) and closes the body.

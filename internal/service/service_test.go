@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -195,6 +196,65 @@ func TestApplyUserDeltaAddPreparesLimiterBeforeKernelUpdate(t *testing.T) {
 	}
 	if s.speedTracker.GetLimiter("uuid-new") == nil {
 		t.Fatal("expected limiter for delta-added user after successful update")
+	}
+}
+
+func TestUserRevocationAndRecovery(t *testing.T) {
+	for _, snapshot := range []bool{true, false} {
+		t.Run(fmt.Sprintf("snapshot=%t", snapshot), func(t *testing.T) {
+			k := &fakeKernel{running: true}
+			s := newTestService(k)
+			s.lastConfig = &model.NodeSpec{Protocol: "vless"}
+			oldUsers := []model.UserSpec{{ID: 1, UUID: "old-user", SpeedLimit: 4}}
+			s.updateUserState(oldUsers)
+			if snapshot {
+				s.applyUserUpdate(context.Background(), []model.UserSpec{}, "")
+			} else {
+				s.applyUserDelta(context.Background(), "remove", oldUsers)
+			}
+			if k.running || len(s.lastUsers) != 0 || s.speedTracker.GetLimiter("old-user") != nil {
+				t.Fatal("revoking all users must stop listeners and remove user state")
+			}
+			if k.updateCalls != 0 || k.startCalls != 0 {
+				t.Fatal("must not pass empty users to kernel APIs that may enable anonymous access")
+			}
+			newUsers := []model.UserSpec{{ID: 2, UUID: "new-user", SpeedLimit: 8}}
+			if snapshot {
+				s.applyUserUpdate(context.Background(), newUsers, "")
+			} else {
+				s.applyUserDelta(context.Background(), "add", newUsers)
+			}
+			if !k.running || k.startCalls != 1 || len(s.lastUsers) != 1 || s.lastUsers[0].ID != 2 || s.speedTracker.GetLimiter("new-user") == nil {
+				t.Fatal("new users must restart the stopped kernel with updated limits")
+			}
+		})
+	}
+}
+
+func TestApplyUserUpdateBeforeConfig(t *testing.T) {
+	k := &fakeKernel{}
+	s := newTestService(k)
+	users := []model.UserSpec{{ID: 1, UUID: "new-user"}}
+	s.applyUserUpdate(context.Background(), users, "")
+	if k.startCalls != 0 || len(s.lastUsers) != 1 {
+		t.Fatal("retain users until a node config is available")
+	}
+}
+
+func TestApplyUserDeltaCredentialRotation(t *testing.T) {
+	k := &fakeKernel{running: true}
+	s := newTestService(k)
+	s.lastConfig = &model.NodeSpec{Protocol: "vless"}
+	s.updateUserState([]model.UserSpec{{ID: 1, UUID: "old-key", SpeedLimit: 4}})
+	newUsers := []model.UserSpec{{ID: 1, UUID: "new-key", SpeedLimit: 8}}
+	k.onUpdateUsers = func(users []model.UserSpec) {
+		if len(users) != 1 || users[0].UUID != "new-key" || k.speedLimitFunc("new-key") == nil {
+			t.Fatal("replacement credentials and limits must be applied together")
+		}
+	}
+	s.applyUserDelta(context.Background(), "add", newUsers)
+	if k.updateCalls != 1 || k.removeCalls != 0 || k.addCalls != 0 || s.lastUsers[0].UUID != "new-key" {
+		t.Fatal("credential rotation must not remove the sole user before installing its replacement")
 	}
 }
 

@@ -24,7 +24,7 @@ The initial independently authored AGPL-3.0-only files are:
 - `internal/kernel/xray/bandwidth_test.go`
 - `internal/kernel/integration_test.go`
 
-Source files carry SPDX identifiers to make these boundaries explicit. Preserve existing copyright and attribution notices. New independent source files must use `SPDX-License-Identifier: AGPL-3.0-only`; edits to inherited MPL files must remain available under MPL-2.0. Moving inherited code into a new file does not make it eligible for AGPL-only licensing. The Compose configuration, adapted from the upstream `compose` branch, remains MPL-2.0.
+The initial AGPL-only files listed above carry explicit SPDX identifiers; inherited source files may not yet have a header. A missing header does not change a file's license under this policy. Preserve existing copyright and attribution notices. New independent source files must use `SPDX-License-Identifier: AGPL-3.0-only`; edits to inherited MPL files must remain available under MPL-2.0. Moving inherited code into a new file does not make it eligible for AGPL-only licensing. The Compose configuration, adapted from the upstream `compose` branch, remains MPL-2.0.
 
 `AGPL-3.0-only` means version 3 only; this policy does not grant an option to use later AGPL versions.
 

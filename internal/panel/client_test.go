@@ -2,12 +2,60 @@ package panel
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/kirakirai8023/Xboard-Node/internal/config"
 )
+
+func TestClientTransportErrorsOmitAuthenticatedURL(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	server.Close()
+	client := NewClient(config.PanelConfig{URL: server.URL, Token: "token&secret", NodeID: 1})
+	for _, method := range []string{"GET", "POST"} {
+		_, err := client.doRequest(method, "/test", nil, "")
+		if err == nil {
+			t.Fatal("expected connection failure")
+		}
+		for _, secret := range []string{"token&secret", url.QueryEscape("token&secret")} {
+			if strings.Contains(err.Error(), secret) {
+				t.Fatal("transport error exposed the panel token")
+			}
+		}
+		var urlErr *url.Error
+		if !errors.As(err, &urlErr) || urlErr.URL != "[redacted]" {
+			t.Fatalf("expected a redacted URL error preserving its cause, got %v", err)
+		}
+	}
+}
+
+func TestClientHTTPErrorBodiesOmitSecrets(t *testing.T) {
+	server, client := newTestServer(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "echoed-token-and-private-key", http.StatusForbidden)
+	})
+	defer server.Close()
+	for _, call := range []struct {
+		name string
+		run  func() error
+	}{
+		{"handshake", func() error { _, err := client.Handshake(); return err }},
+		{"config", func() error { _, err := client.GetConfig(); return err }},
+		{"users", func() error { _, err := client.GetUsers(); return err }},
+		{"machine nodes", func() error { _, err := client.GetMachineNodes(); return err }},
+		{"report", func() error { return client.postJSON("/test", map[string]interface{}{}) }},
+	} {
+		t.Run(call.name, func(t *testing.T) {
+			err := call.run()
+			if err == nil || !strings.Contains(err.Error(), "403") || strings.Contains(err.Error(), "echoed-token-and-private-key") {
+				t.Fatalf("HTTP error must retain status without dumping the response: %v", err)
+			}
+		})
+	}
+}
 
 func newTestServer(handler http.HandlerFunc) (*httptest.Server, *Client) {
 	ts := httptest.NewServer(handler)

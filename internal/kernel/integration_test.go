@@ -96,6 +96,7 @@ func TestOfficialKernelsTraffic(t *testing.T) {
 			address := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
 			conn := dialNode(t, tc.protocol, address, echo.Addr().String(), users[0].UUID)
 			defer conn.Close()
+			active := conn
 			roundTrip(t, conn)
 
 			users[0].SpeedLimit = 16
@@ -108,7 +109,9 @@ func TestOfficialKernelsTraffic(t *testing.T) {
 				t.Fatalf("bidirectional traffic = %v, error = %v", traffic, err)
 			}
 
-			if backend == "singbox" {
+			// Xray SOCKS is only a test transport: the daemon's Xray Protocols()
+			// excludes it, and it has no live UserManager for credential updates.
+			if backend == "singbox" || tc.protocol == "vless" {
 				_ = conn.Close()
 				previous := traffic[1]
 				users = []model.UserSpec{{ID: 1, UUID: "22222222-2222-2222-2222-222222222222", SpeedLimit: 16}}
@@ -117,29 +120,63 @@ func TestOfficialKernelsTraffic(t *testing.T) {
 				}
 				next := dialNode(t, tc.protocol, address, echo.Addr().String(), users[0].UUID)
 				defer next.Close()
+				active = next
 				roundTrip(t, next)
 				traffic, _, _, _ = nodeKernel.GetUserTraffic(context.Background())
 				if traffic[1][0] <= previous[0] || traffic[1][1] <= previous[1] {
 					t.Fatalf("replacement reset traffic counters: before=%v after=%v", previous, traffic[1])
 				}
+				assertCredentialRejected(t, tc.protocol, address, echo.Addr().String(), "11111111-1111-1111-1111-111111111111")
 			}
+
+			// Revoking the last user calls Stop. It must close real listeners
+			// and existing sessions, rather than just clearing IsRunning().
+			nodeKernel.Stop()
+			if nodeKernel.IsRunning() {
+				t.Fatal("kernel still reports running after Stop")
+			}
+			if probe, err := net.DialTimeout("tcp", address, time.Second); err == nil {
+				probe.Close()
+				t.Fatal("stopped kernel still accepts new connections")
+			}
+			_ = active.SetDeadline(time.Now().Add(time.Second))
+			if _, err := active.Write([]byte("revoked")); err == nil {
+				var response [7]byte
+				if n, _ := active.Read(response[:]); n > 0 {
+					t.Fatal("stopped kernel still proxies existing sessions")
+				}
+			}
+			if err := nodeKernel.Start(node, users, kernel.TLSCert{}); err != nil {
+				t.Fatalf("restart after all users revoked: %v", err)
+			}
+			restored := dialNode(t, tc.protocol, address, echo.Addr().String(), users[0].UUID)
+			defer restored.Close()
+			roundTrip(t, restored)
 		})
 	}
 }
 
 func dialNode(t *testing.T, protocol, address, target, credential string) net.Conn {
 	t.Helper()
+	conn, err := dialNodeWithCredential(protocol, address, target, credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return conn
+}
+
+func dialNodeWithCredential(protocol, address, target, credential string) (net.Conn, error) {
 	if protocol == "socks" {
-		return dialSOCKS(t, address, target, credential)
+		return dialSOCKS(address, target, credential)
 	}
 	conn, err := net.DialTimeout("tcp", address, 2*time.Second)
 	if err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
 	id, err := hex.DecodeString(strings.ReplaceAll(credential, "-", ""))
 	if err != nil {
 		conn.Close()
-		t.Fatal(err)
+		return nil, err
 	}
 	host, portString, _ := net.SplitHostPort(target)
 	port, _ := strconv.Atoi(portString)
@@ -149,9 +186,26 @@ func dialNode(t *testing.T, protocol, address, target, credential string) net.Co
 	header = append(header, net.ParseIP(host).To4()...)
 	if _, err := conn.Write(header); err != nil {
 		conn.Close()
-		t.Fatal(err)
+		return nil, err
 	}
-	return &vlessTestConn{Conn: conn}
+	return &vlessTestConn{Conn: conn}, nil
+}
+
+func assertCredentialRejected(t *testing.T, protocol, address, target, credential string) {
+	t.Helper()
+	conn, err := dialNodeWithCredential(protocol, address, target, credential)
+	if err != nil {
+		return // SOCKS authentication can fail during dialing.
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Write([]byte("revoked")); err != nil {
+		return
+	}
+	var response [7]byte
+	if n, _ := conn.Read(response[:]); n > 0 {
+		t.Fatal("revoked credentials still allowed proxy traffic")
+	}
 }
 
 type vlessTestConn struct {
@@ -173,19 +227,14 @@ func (c *vlessTestConn) Read(p []byte) (int, error) {
 	return c.Conn.Read(p)
 }
 
-func dialSOCKS(t *testing.T, address, target, credential string) net.Conn {
-	t.Helper()
+func dialSOCKS(address, target, credential string) (net.Conn, error) {
 	dialer, err := proxy.SOCKS5("tcp", address, &proxy.Auth{User: credential, Password: credential}, &net.Dialer{Timeout: 2 * time.Second})
 	if err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	conn, err := dialer.(proxy.ContextDialer).DialContext(ctx, "tcp", target)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return conn
+	return dialer.(proxy.ContextDialer).DialContext(ctx, "tcp", target)
 }
 
 func roundTrip(t *testing.T, conn net.Conn) {

@@ -12,7 +12,7 @@ This independently maintained fork uses `github.com/kirakirai8023/Xboard-Node` a
 
 ## Build, Test, and Development Commands
 
-Use Go 1.27.1 as declared in `go.mod`. Make targets assume a POSIX shell, such as Linux or WSL.
+Use Go 1.27.3 as declared in `go.mod`. Make targets assume a POSIX shell, such as Linux or WSL.
 
 - `make build`: build `xboard-node` and `xbctl` with the configured feature tags.
 - `make test`: run `go test -v -race -count=1 ./internal/...`, matching CI.

@@ -36,9 +36,6 @@ import (
 )
 
 const (
-	// drainTimeout is how long Stop waits for in-flight connections to finish
-	// before hard-killing the instance. Skipped during hot-reload for speed.
-	drainTimeout = 5 * time.Second
 	// startTimeout caps how long instance.Start() may block.
 	startTimeout = 30 * time.Second
 )
@@ -54,10 +51,11 @@ const (
 type Xray struct {
 	cfg config.KernelConfig
 
-	// mu protects instance, limitDispatcher, users, protocol, inboundTag,
+	// mu protects instance, cancel, limitDispatcher, users, protocol, inboundTag,
 	// lastKernelHash, and cumTraffic. Never held during slow I/O.
 	mu              sync.Mutex
 	instance        *xrayCore.Instance
+	cancel          context.CancelFunc
 	limitDispatcher *LimitDispatcher
 	users           []model.UserSpec
 	nodeConfig      *model.NodeSpec
@@ -128,16 +126,19 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 	}
 
 	// ── Phase 2: Create instance (global lock for LD capture) ───────────
+	ctx, cancel := context.WithCancel(context.Background())
 	xrayCreationMu.Lock()
-	inst, err := xrayCore.New(pbConfig)
+	inst, err := xrayCore.NewWithContext(ctx, pbConfig)
 	ld := globalLimitDispatcher.Load()
 	xrayCreationMu.Unlock()
 	if err != nil {
+		cancel()
 		return fmt.Errorf("create xray: %w", err)
 	}
 
 	// ── Phase 3: Start new (no lock, potentially slow) ──────────────────
 	if err := startWithTimeout(inst, startTimeout); err != nil {
+		cancel()
 		inst.Close()
 		return err
 	}
@@ -146,7 +147,9 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 	x.mu.Lock()
 	old := x.instance
 	oldLD := x.limitDispatcher
+	oldCancel := x.cancel
 	x.instance = inst
+	x.cancel = cancel
 	x.limitDispatcher = ld
 	x.users = users
 	x.nodeConfig = nodeConfig
@@ -159,7 +162,7 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 	x.mu.Unlock()
 
 	// ── Phase 5: Recycle old (background, non-blocking) ─────────────────
-	closeOld(old, oldLD)
+	closeOld(old, oldLD, oldCancel)
 
 	x.updateDispatcherLimits(users)
 	x.updateBandwidthLimits(users)
@@ -195,21 +198,31 @@ func (x *Xray) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ke
 	return x.Start(nodeConfig, users, tls)
 }
 
-// Stop gracefully shuts down the kernel, draining active connections first.
+// Stop closes listeners and cancels sessions before returning. User revocation
+// must not leave an instance accepting traffic while background draining runs.
 func (x *Xray) Stop() {
 	x.running.Store(false)
 
 	x.mu.Lock()
 	inst := x.instance
 	ld := x.limitDispatcher
+	cancel := x.cancel
 	x.instance = nil
 	x.limitDispatcher = nil
+	x.cancel = nil
 	x.mu.Unlock()
 
-	if ld != nil {
-		drainConns(ld, drainTimeout)
+	if cancel != nil {
+		cancel()
 	}
-	closeOld(inst, ld)
+	if inst != nil {
+		if err := inst.Close(); err != nil {
+			nlog.Core().Warn("xray: close instance failed", "error", err)
+		}
+	}
+	if ld != nil {
+		ld.ResetConns()
+	}
 }
 
 func (x *Xray) IsRunning() bool { return x.running.Load() }
@@ -674,18 +687,28 @@ func startWithTimeout(inst *xrayCore.Instance, timeout time.Duration) error {
 // closeOld shuts down a previously running instance and its dispatcher.
 // Recycling happens in a background goroutine to prevent the main thread
 // from blocking on slow connection draining, enabling "hitless" reload.
-func closeOld(inst *xrayCore.Instance, ld *LimitDispatcher) {
+func closeOld(inst *xrayCore.Instance, ld *LimitDispatcher, cancel context.CancelFunc) {
 	if inst == nil {
+		if cancel != nil {
+			cancel()
+		}
 		return
+	}
+	// Stop accepting new sessions with the old configuration immediately.
+	if manager := inst.GetFeature(inbound.ManagerType()); manager != nil {
+		_ = manager.Close()
 	}
 	go func() {
 		// 1. Drain connections gracefully (best effort, e.g. 5 minutes)
-		// We use a much longer timeout here than the default Stop() because
-		// it's running in background and doesn't block new user connections.
+		// Superseded listeners are already closed. Existing sessions may drain
+		// in the background while the replacement accepts new connections.
 		if ld != nil {
 			drainConns(ld, 5*time.Minute)
 		}
 		// 2. Hard close
+		if cancel != nil {
+			cancel()
+		}
 		inst.Close()
 		if ld != nil {
 			ld.ResetConns()

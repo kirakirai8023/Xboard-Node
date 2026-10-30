@@ -3,14 +3,17 @@ package panel
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/kirakirai8023/Xboard-Node/internal/nlog"
 )
 
 // fakeWSServer simulates a minimal Workerman-style WS server for testing.
@@ -287,5 +290,90 @@ func TestWSClient_UserDeltaEvent(t *testing.T) {
 	}
 	if len(received[0].DeltaUsers) != 1 || received[0].DeltaUsers[0].ID != 42 {
 		t.Errorf("unexpected DeltaUsers: %+v", received[0].DeltaUsers)
+	}
+}
+
+func TestWSClient_FullUserSnapshotEmptyAndMissing(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		payload string
+		want    bool
+	}{
+		{"empty revokes all", `{"users":[],"node_id":7}`, true},
+		{"missing is not a snapshot", `{"node_id":7}`, false},
+		{"null is not a snapshot", `{"users":null,"node_id":7}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var received []WSEvent
+			ws := NewWSClient("", "", 1, WSClientConfig{}, func(event WSEvent) {
+				received = append(received, event)
+			}, nil, nil)
+			ws.handleDataEvent(wsMessage{Event: WSEventSyncUsers, Data: json.RawMessage(tc.payload)})
+			if !tc.want {
+				if len(received) != 0 {
+					t.Fatal("missing/null users must not revoke users")
+				}
+				return
+			}
+			if len(received) != 1 || received[0].Users == nil || len(received[0].Users) != 0 || received[0].NodeID != 7 {
+				t.Fatalf("empty full snapshot was lost: %+v", received)
+			}
+		})
+	}
+}
+
+func TestWSClient_DebugLogsOmitSecrets(t *testing.T) {
+	logPath := t.TempDir() + "/ws.log"
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logFile.Close()
+	nlog.Init(logFile, slog.LevelDebug, false)
+	defer nlog.Init(os.Stdout, slog.LevelInfo, true)
+
+	events := []wsMessage{
+		{Event: WSEventSyncConfig, Data: json.RawMessage(`{"config":{"protocol":"vless","server_port":443,"cert_config":{"key_content":"private-key-secret","dns_env":{"DNS_TOKEN":"dns-secret"}}}}`)},
+		{Event: WSEventSyncUsers, Data: json.RawMessage(`{"users":[{"id":1,"uuid":"user-credential-secret"}]}`)},
+	}
+	server := fakeWSServer(t, events)
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	received := make(chan WSEvent, 2)
+	ws := NewWSClient("ws://"+strings.TrimPrefix(server.URL, "http://"), "panel-token-secret", 1, WSClientConfig{}, func(event WSEvent) {
+		received <- event
+	}, nil, nil)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ws.Run(ctx)
+	}()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Error("WebSocket client did not stop")
+		}
+	}()
+	for range events {
+		select {
+		case <-received:
+		case <-time.After(3 * time.Second):
+			t.Fatal("did not receive test events")
+		}
+	}
+	logs, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"panel-token-secret", "private-key-secret", "dns-secret", "user-credential-secret"} {
+		if strings.Contains(string(logs), secret) {
+			t.Fatalf("WebSocket logs exposed %q", secret)
+		}
+	}
+	if !strings.Contains(string(logs), "ws connecting") || !strings.Contains(string(logs), "ws recv") {
+		t.Fatal("expected connection and message metadata in debug logs")
 	}
 }

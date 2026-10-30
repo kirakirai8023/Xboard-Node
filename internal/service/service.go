@@ -751,28 +751,25 @@ func (s *Service) startKernel(nc *model.NodeSpec, users []model.UserSpec) bool {
 	return true
 }
 
-// ensureRunning starts the kernel if it is not running and there are users +
-// config available. Returns true if the kernel is running afterwards.
-func (s *Service) ensureRunning() bool {
-	if s.kernel.IsRunning() {
-		return true
-	}
-	if len(s.lastUsers) > 0 && s.lastConfig != nil {
-		return s.startKernel(s.lastConfig, s.lastUsers)
-	}
-	return false
-}
-
 // ─── User update entry points ───────────────────────────────────────────────
 
 // applyUserUpdate replaces the full user set and hot-swaps the kernel.
 // Called from WS sync.users and REST polling.
 func (s *Service) applyUserUpdate(ctx context.Context, users []model.UserSpec, newHash string) {
-	if !s.ensureRunning() {
+	prevUsers, prevHash := s.prepareUserState(users)
+	// Empty authentication lists can enable anonymous SOCKS/HTTP access.
+	// Stop listeners centrally rather than relying on protocol-specific behavior.
+	if len(users) == 0 {
+		s.kernel.Stop()
+		s.appliedState.Users = nil
 		return
 	}
-
-	prevUsers, prevHash := s.prepareUserState(users)
+	if !s.kernel.IsRunning() {
+		if s.lastConfig != nil && !s.startKernel(s.lastConfig, users) {
+			s.restoreUserState(prevUsers, prevHash)
+		}
+		return
+	}
 	added, removed, err := s.kernel.UpdateUsers(users)
 	if err != nil {
 		nlog.Core().Warn(fmt.Sprintf("UpdateUsers failed, restarting kernel: %v", err))
@@ -790,7 +787,7 @@ func (s *Service) applyUserUpdate(ctx context.Context, users []model.UserSpec, n
 }
 
 // applyUserDelta applies an incremental user change (add or remove) directly
-// via the kernel's atomic user API. Kernel updates run before updateUserState.
+// via the kernel's user API. Empty sets and stopped kernels use applyUserUpdate.
 func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers []model.UserSpec) {
 	switch action {
 	case "add":
@@ -800,15 +797,18 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 		}
 		merged := mergeUsers(s.lastUsers, deltaUsers)
 
-		if !s.ensureRunning() {
+		if !s.kernel.IsRunning() {
+			s.applyUserUpdate(ctx, merged, "")
 			return
 		}
 
 		for _, delta := range deltaUsers {
 			for _, old := range s.lastUsers {
 				if old.ID == delta.ID && old.UUID != delta.UUID {
-					s.kernel.RemoveUsers([]model.UserSpec{old})
-					break
+					// Apply a credential replacement together: removing the sole
+					// user first can stop the kernel before AddUsers runs.
+					s.applyUserUpdate(ctx, merged, "")
+					return
 				}
 			}
 		}
@@ -834,7 +834,8 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 		}
 		filtered := subtractUsers(s.lastUsers, deltaUsers)
 
-		if !s.kernel.IsRunning() {
+		if len(filtered) == 0 || !s.kernel.IsRunning() {
+			s.applyUserUpdate(ctx, filtered, "")
 			return
 		}
 
