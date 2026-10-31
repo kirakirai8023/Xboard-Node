@@ -411,9 +411,13 @@ func (s *Service) applyRemoteOverrides(ctx context.Context, nc *model.NodeSpec) 
 		s.cfg.Kernel.LogLevel = nc.KernelLogLevel
 	}
 
-	// Certificate configuration from panel (panel-first: takes precedence over local config)
-	if nc.CertConfig != nil {
-		return s.applyNodeCert(ctx, nc.CertConfig)
+	// Panel-first unless the administrator explicitly selected local management.
+	selectedCert, fromPanel := config.ResolveCertificatePolicy(s.cfg.Cert, nc.CertConfig)
+	if fromPanel {
+		return s.applyNodeCert(ctx, &selectedCert)
+	}
+	if s.cfg.Cert.UsesLocalSource() {
+		return false
 	}
 
 	// Legacy fields (deprecated: prefer cert_config)
@@ -1289,10 +1293,14 @@ func validateNodeRuntime(cfg *config.Config, kcfgSupported []string, spec *model
 	if !containsString(kcfgSupported, spec.Protocol) {
 		return fmt.Errorf("protocol %q is not supported by kernel %q", spec.Protocol, cfg.Kernel.Type)
 	}
-	if err := validateTLSRequirements(spec, tls, cfgKernelType(cfg)); err != nil {
+	// Validate the selected policy without modifying the panel snapshot or hash.
+	effective := *spec
+	selectedCert, _ := config.ResolveCertificatePolicy(cfg.Cert, spec.CertConfig)
+	effective.CertConfig = &selectedCert
+	if err := validateTLSRequirements(&effective, tls, cfgKernelType(cfg)); err != nil {
 		return err
 	}
-	if err := validateRuntimeCertConfig(spec); err != nil {
+	if err := validateRuntimeCertConfig(&effective); err != nil {
 		return err
 	}
 	return nil

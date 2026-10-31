@@ -322,11 +322,8 @@ func inspectDeploymentNode(node *model.NodeSpec, id int, local config.CertConfig
 	if (network == "xhttp" || network == "splithttp") && view.Path == "" {
 		view.Path = "/"
 	}
-	certificate := local
-	if node.CertConfig != nil {
-		certificate = *node.CertConfig
-		view.PanelCert = true
-	}
+	certificate, fromPanel := config.ResolveCertificatePolicy(local, node.CertConfig)
+	view.PanelCert = fromPanel
 	view.CertMode = effectiveDeploymentCertMode(certificate)
 	if view.Domain == "" {
 		view.Domain = certificate.Domain
@@ -336,9 +333,6 @@ func inspectDeploymentNode(node *model.NodeSpec, id int, local config.CertConfig
 	}
 	view.NeedsCert = node.TLS == 1 || node.Protocol == "tuic" || node.Protocol == "hysteria" || node.Protocol == "hysteria2" || node.Protocol == "anytls" || node.Protocol == "trojan" && node.TLS != 2
 	if view.NeedsCert {
-		if view.PanelCert && view.CertMode == "none" {
-			return view, errors.New("panel certificate mode is none while TLS is enabled; configure the panel certificate policy first")
-		}
 		if err := validateDeploymentCert(certificate); err != nil {
 			return view, fmt.Errorf("certificate policy: %w", err)
 		}
@@ -416,6 +410,9 @@ func effectiveDeploymentCertMode(cfg config.CertConfig) string {
 	if cfg.AutoTLS {
 		return "http"
 	}
+	if cfg.CertContent != "" && cfg.KeyContent != "" {
+		return "content"
+	}
 	if cfg.CertFile != "" && cfg.KeyFile != "" {
 		return "file"
 	}
@@ -423,6 +420,9 @@ func effectiveDeploymentCertMode(cfg config.CertConfig) string {
 }
 
 func validateDeploymentCert(cfg config.CertConfig) error {
+	if err := cfg.ValidateSource(); err != nil {
+		return err
+	}
 	mode := effectiveDeploymentCertMode(cfg)
 	if mode == "none" {
 		return nil
@@ -522,6 +522,7 @@ func runDeploymentCert(args []string) error {
 	fs := flag.NewFlagSet("deploy cert", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	mode := fs.String("mode", "file", "file, dns, http, self or none")
+	source := fs.String("source", config.CertSourceLocal, "local or panel certificate policy")
 	domain := fs.String("domain", "", "certificate hostname")
 	certFile := fs.String("cert-file", "", "existing certificate")
 	keyFile := fs.String("key-file", "", "existing private key")
@@ -532,7 +533,7 @@ func runDeploymentCert(args []string) error {
 	if fs.Parse(args) != nil || fs.NArg() != 0 || *output == "" {
 		return errors.New("invalid deploy cert arguments; provide --output")
 	}
-	profile := config.CertConfig{CertMode: *mode, Domain: *domain, CertFile: *certFile, KeyFile: *keyFile, Email: *email, HTTPPort: *httpPort}
+	profile := config.CertConfig{Source: *source, CertMode: *mode, Domain: *domain, CertFile: *certFile, KeyFile: *keyFile, Email: *email, HTTPPort: *httpPort}
 	if *mode == "dns" {
 		secret, err := readDeploymentSecret(*secretFile)
 		if err != nil {

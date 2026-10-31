@@ -303,7 +303,7 @@ inspect_binding() {
     INSPECTION_FILE="$TOKEN_DIR/inspection.tsv"
     say '正在读取面板实际配置和用户列表……'
     (umask 077; "$CLI_FILE" "${options[@]}" > "$INSPECTION_FILE") || {
-        fail '面板预检未通过。请检查上方原因；XHTTP 应使用 Xray，并清空面板和客户端的 flow。'; return 1;
+        fail '面板预检未通过，请按上方具体原因修正后重试。'; return 1;
     }
     CERT_NEEDED=0; REPORT_NODES=0; NODE_DOMAIN=""; NODE_NETWORK=""; NODE_PATH_VALUE=""
     LISTENER_PORTS=(); LISTENER_PROTOCOLS=()
@@ -314,7 +314,7 @@ inspect_binding() {
                 say "节点 $id：$protocol / $network，TLS=$tls，监听 $listen:$port，用户数=$users"
                 say "  Host/SNI=$domain；路径=$path；证书=$cert_mode；面板管理证书=$panel_cert"
                 LISTENER_PORTS+=("$port"); LISTENER_PROTOCOLS+=("$protocol")
-                if [[ "$needs_cert" == true && "$panel_cert" != true && "$cert_mode" == none ]]; then CERT_NEEDED=$((CERT_NEEDED+1)); fi
+                if [[ "$needs_cert" == true && "$cert_mode" == none ]]; then CERT_NEEDED=$((CERT_NEEDED+1)); fi
                 NODE_DOMAIN=$domain; NODE_NETWORK=$network; NODE_PATH_VALUE=$path
                 ;;
             WARNING) say "提示：$id" ;;
@@ -350,13 +350,14 @@ check_listener_ports() {
 read_certificate() {
     [[ "$CERT_NEEDED" -gt 0 ]] || return 0
     local choice domain cert_file key_file email secret listeners
-    say '该节点需要本地证书。面板的 cert_config 优先于本地证书设置。'
+    say '该节点尚未配置可用证书。选择以下方式后，将由本机管理此实例的证书（cert.source=local）。'
+    say '本实例的证书将使用本地设置，面板的 cert_config 不再覆盖它；传输和 TLS 开关仍由面板管理。'
     say '证书来源：1=已有 PEM 文件（含 Cloudflare Origin CA），2=Cloudflare DNS 自动申请并续期'
     say '          3=HTTP 自动申请并续期（公网 80 端口）'
     ask choice '选择证书来源' 1 || return 1
     [[ "$NODE_DOMAIN" != - ]] || NODE_DOMAIN=""
     ask domain '源站证书覆盖的域名（不含 https:// 或路径）' "$NODE_DOMAIN" || return 1
-    local -a options=(deploy cert --domain "$domain" --output "$TOKEN_DIR/certificate.yml")
+    local -a options=(deploy cert --source local --domain "$domain" --output "$TOKEN_DIR/certificate.yml")
     case "$choice" in
         1)
             ask cert_file '证书 PEM 的绝对路径' || return 1

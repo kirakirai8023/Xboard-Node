@@ -212,11 +212,18 @@ func TestDeployment_CertificateValidation(t *testing.T) {
 		t.Fatal("invalid key was not rejected safely")
 	}
 	node := &model.NodeSpec{Protocol: "vless", Network: "xhttp", TLS: 1, ServerPort: 443, CertConfig: &config.CertConfig{CertMode: "none"}}
-	if _, err := inspectDeploymentNode(node, 1, valid, "cloudflare"); err == nil {
-		t.Fatal("panel none incorrectly fell back to local certificate")
+	view, err := inspectDeploymentNode(node, 1, valid, "cloudflare")
+	if err != nil || !view.PanelCert || view.CertMode != "none" || !view.NeedsCert {
+		t.Fatalf("missing panel certificate must reach the wizard without silently using local material: %+v %v", view, err)
 	}
+	valid.Source = config.CertSourceLocal
+	view, err = inspectDeploymentNode(node, 1, valid, "cloudflare")
+	if err != nil || view.PanelCert || view.CertMode != "content" {
+		t.Fatalf("explicit local policy was rejected: %+v %v", view, err)
+	}
+	valid.Source = ""
 	node.CertConfig = &valid
-	view, err := inspectDeploymentNode(node, 1, config.CertConfig{CertMode: "file", CertFile: "missing"}, "cloudflare")
+	view, err = inspectDeploymentNode(node, 1, config.CertConfig{CertMode: "file", CertFile: "missing"}, "cloudflare")
 	if err != nil || !view.PanelCert {
 		t.Fatalf("panel precedence failed: %v", err)
 	}
@@ -250,11 +257,60 @@ func TestDeployment_PrivateDNSProfileAndConfigMerge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(root.Instances) != 1 || root.Instances[0].Cert.DNSEnv["CLOUDFLARE_DNS_API_TOKEN"] != "dns-fixture-secret" {
+	if len(root.Instances) != 1 || !root.Instances[0].Cert.UsesLocalSource() || root.Instances[0].Cert.DNSEnv["CLOUDFLARE_DNS_API_TOKEN"] != "dns-fixture-secret" {
 		t.Fatal("certificate profile lost on merge")
 	}
 	if err := runConfigInit([]string{"--cert-profile"}); err == nil {
 		t.Fatal("accepted missing profile value")
+	}
+}
+
+func TestDeployment_PanelNoneAndLocalProfile(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/config") {
+			_, _ = w.Write([]byte(`{"protocol":"vless","network":"xhttp","tls":1,"server_port":443,"server_name":"node.example.com","cert_config":{"cert_mode":"none"}}`))
+		} else {
+			_, _ = w.Write([]byte(`{"users":[{"id":1,"uuid":"fixture"}]}`))
+		}
+	}))
+	defer server.Close()
+	dir := t.TempDir()
+	output := filepath.Join(dir, "config.yml")
+	profile := filepath.Join(dir, "certificate.yml")
+	token := filepath.Join(dir, "token")
+	credentials := filepath.Join(dir, "credentials.env")
+	if err := os.WriteFile(token, []byte("fixture-token"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// Inspecting a new binding must reach certificate selection despite the
+	// panel's default none policy; installed inspection remains strict.
+	if err := runDeploymentInspect([]string{"--panel-url", server.URL, "--node-id", "1", "--token-file", token, "--topology", "cloudflare"}); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"--mode", "node", "--node-id", "1", "--panel-url", server.URL, "--kernel", "xray", "--output", output, "--credentials-out", credentials, "--token-file", token}
+	if err := runConfigInit(args); err != nil {
+		t.Fatal(err)
+	}
+	inspectArgs := []string{"--config", output, "--credentials-in", credentials, "--topology", "cloudflare"}
+	if err := runDeploymentInspect(inspectArgs); err == nil {
+		t.Fatal("installed node without certificate was accepted")
+	}
+	certPEM, keyPEM := deploymentPEM(t, false)
+	certFile, keyFile := filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
+	if err := os.WriteFile(certFile, []byte(certPEM), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyFile, []byte(keyPEM), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := runDeploymentCert([]string{"--mode", "file", "--domain", "node.example.com", "--cert-file", certFile, "--key-file", keyFile, "--output", profile}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runConfigInit(append(args, "--config", output, "--cert-profile", profile)); err != nil {
+		t.Fatal(err)
+	}
+	if err := runDeploymentInspect(inspectArgs); err != nil {
+		t.Fatalf("selected local certificate was overridden by panel none: %v", err)
 	}
 }
 

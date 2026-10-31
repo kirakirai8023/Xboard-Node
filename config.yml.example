@@ -31,3 +31,11 @@
 #   xray_forwarding: "auto"  # compatible keeps managed traffic on the limiter path
 #   sniffing: "off"          # route_only; override_destination is Xray-only
 #   custom_config: "/etc/xboard-node/kernel.json"
+
+# Optional local certificate management for a panel-managed TLS node:
+# cert:
+#   source: "local"          # Default: panel-first; local ignores panel cert_config
+#   cert_mode: "file"        # Or configure DNS-01 through the deployment wizard
+#   domain: "node.example.com"
+#   cert_file: "/etc/xboard-node/certs/cert.pem"
+#   key_file: "/etc/xboard-node/certs/key.pem"

@@ -902,7 +902,7 @@ func writeRootConfig(path string, root *config.RootConfig) error {
 	if p.WS.StatusInterval != 0 || p.WS.HandshakeTimeout != 0 || p.WS.BackoffInitial != 0 {
 		out.WS = &p.WS
 	}
-	if p.Cert.CertMode != "" || p.Cert.Domain != "" || p.Cert.CertFile != "" || p.Cert.AutoTLS {
+	if p.Cert.Source != "" || p.Cert.CertMode != "" || p.Cert.Domain != "" || p.Cert.CertFile != "" || p.Cert.AutoTLS {
 		out.Cert = &p.Cert
 	}
 
@@ -954,7 +954,7 @@ func writeRootConfig(path string, root *config.RootConfig) error {
 			fi.Panel.NodeID = 0
 			fi.Panel.NodeType = ""
 		}
-		if inst.Cert.CertMode != "" || inst.Cert.Domain != "" || inst.Cert.CertFile != "" || inst.Cert.AutoTLS {
+		if inst.Cert.Source != "" || inst.Cert.CertMode != "" || inst.Cert.Domain != "" || inst.Cert.CertFile != "" || inst.Cert.AutoTLS {
 			fi.Cert = &inst.Cert
 		}
 		if inst.WS.StatusInterval != 0 || inst.WS.HandshakeTimeout != 0 || inst.WS.BackoffInitial != 0 {

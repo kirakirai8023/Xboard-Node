@@ -152,6 +152,8 @@ type KernelConfig struct {
 }
 
 type CertConfig struct {
+	// Source defaults to panel-first. "local" explicitly ignores panel policies.
+	Source   string `yaml:"source,omitempty"`
 	AutoTLS  bool   `yaml:"auto_tls"`
 	Domain   string `yaml:"domain"`
 	Email    string `yaml:"email"`
@@ -527,6 +529,9 @@ func (c *Config) inheritFrom(parent *Config) {
 		c.Kernel.CustomRoute = parent.Kernel.CustomRoute
 	}
 	// Cert (NOT cert_dir — derived from config_dir later)
+	if c.Cert.Source == "" {
+		c.Cert.Source = parent.Cert.Source
+	}
 	if c.Cert.CertMode == "" {
 		c.Cert.CertMode = parent.Cert.CertMode
 	}
@@ -701,6 +706,16 @@ func normalizeBaseURL(raw string) (string, string, error) {
 }
 
 func (c *Config) validate() error {
+	if err := c.Cert.ValidateSource(); err != nil {
+		return err
+	}
+	for _, node := range c.Nodes {
+		if node.Cert != nil {
+			if err := node.Cert.ValidateSource(); err != nil {
+				return err
+			}
+		}
+	}
 	if c.IsStandalone() {
 		if err := c.validateStandalone(); err != nil {
 			return err
