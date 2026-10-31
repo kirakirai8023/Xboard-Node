@@ -925,7 +925,9 @@ confirm_uninstall() {
         return
     fi
     echo
-    read -r -p "Proceed with uninstall? [y/N]: " answer
+    local -a input_options=(-r -p "Proceed with uninstall? [y/N]: ")
+    [[ ! -t 0 ]] || input_options+=(-e)
+    read "${input_options[@]}" answer
     if ! [[ "$answer" =~ ^[Yy]$ ]]; then
         log_warn "Uninstall cancelled"
         exit 0

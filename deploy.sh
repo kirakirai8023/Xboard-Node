@@ -30,14 +30,23 @@ ARCH=""
 
 say() { printf '%s\n' "$*"; }
 fail() { printf '错误：%s\n' "$*" >&2; return 1; }
+read_input() {
+    local __xb_input_name=$1 __xb_input_prompt=$2 __xb_input_hidden=${3:-0}
+    local -a __xb_input_options=(-r -p "$__xb_input_prompt")
+    # Readline accepts both Ctrl-H and DEL independently of the terminal's
+    # configured erase character. Keep redirected/scripted input unchanged.
+    [[ ! -t 0 ]] || __xb_input_options+=(-e)
+    [[ "$__xb_input_hidden" != 1 ]] || __xb_input_options+=(-s)
+    read "${__xb_input_options[@]}" "$__xb_input_name"
+}
 confirm() {
     local answer
-    read -r -p "$* [y/N]: " answer || return 1
+    read_input answer "$* [y/N]: " || return 1
     [[ "$answer" == y || "$answer" == Y ]]
 }
 ask() {
     local variable=$1 label=$2 fallback=${3:-} answer
-    read -r -p "$label${fallback:+ [$fallback]}: " answer || return 1
+    read_input answer "$label${fallback:+ [$fallback]}: " || return 1
     printf -v "$variable" '%s' "${answer:-$fallback}"
 }
 need() {
@@ -67,7 +76,7 @@ cleanup_token() {
 read_token() {
     local secret
     cleanup_token
-    IFS= read -r -s -p '通信密钥（输入隐藏）: ' secret || return 1
+    IFS= read_input secret '通信密钥（输入隐藏）: ' 1 || return 1
     printf '\n'
     [[ -n "$secret" && "$secret" != *$'\r'* ]] || { fail '密钥不能为空或包含换行。'; return 1; }
     TOKEN_DIR=$(mktemp -d) || return 1
@@ -368,7 +377,7 @@ read_certificate() {
         2)
             ask email 'ACME 邮箱（可留空）' || return 1
             say 'Cloudflare API Token 需要该域名所在 Zone 的 DNS Edit 和 Zone Read 权限。'
-            IFS= read -r -s -p 'Cloudflare API Token（输入隐藏）: ' secret || return 1
+            IFS= read_input secret 'Cloudflare API Token（输入隐藏）: ' 1 || return 1
             printf '\n'
             [[ -n "$secret" && "$secret" != *$'\r'* ]] || return 1
             (umask 077; printf '%s' "$secret" > "$TOKEN_DIR/dns-token") || return 1
@@ -619,7 +628,7 @@ uninstall_local() {
     local -a options=(uninstall --yes --skip-dependencies)
     if [[ "$purge" == 1 ]]; then
         local answer
-        read -r -p '同时删除配置与证书请输入 DELETE: ' answer || return 1
+        read_input answer '同时删除配置与证书请输入 DELETE: ' || return 1
         [[ "$answer" == DELETE ]] || { say '已取消。'; return 0; }
         options+=(--purge)
     fi
@@ -641,7 +650,7 @@ menu() {
         say '19. 面板 / TLS / CDN 配置预检'
         say '20. 修复服务注册并启动（保留配置和程序）'
         say ' 0. 退出'
-        read -r -p '请选择: ' choice || return 0
+        read_input choice '请选择: ' || return 0
         case "$choice" in
             0) return 0 ;;
             1) install_wizard || say '部署未完成，请检查上方信息。' ;;
