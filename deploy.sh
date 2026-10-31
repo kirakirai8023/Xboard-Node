@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only
+# XBCTL_MIN_VERSION=v1.0.4
 # Independent local-bundle UI; installation is delegated to install.sh.
 set -uo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 BUNDLE_DIR="$SCRIPT_DIR"
+MANAGEMENT_DIR="$SCRIPT_DIR"
 INSTALL_ROOT=/etc/xboard-node
 BACKUP_ROOT=/var/backups/xboard-node
 NODE_PATH=/usr/local/bin/xboard-node
@@ -27,6 +29,8 @@ BACKUP_LAST=""
 NODE_FILE=""
 CLI_FILE=""
 ARCH=""
+MENU_INTERRUPTED=0
+V2BX_PORT_CONFLICT=0
 
 say() { printf '%s\n' "$*"; }
 fail() { printf '错误：%s\n' "$*" >&2; return 1; }
@@ -86,6 +90,9 @@ read_token() {
     unset secret
 }
 with_lock() (
+    trap cleanup_token EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     root_only || exit 1
     need flock || exit 1
     exec 9>"$LOCK_PATH" || exit 1
@@ -134,6 +141,13 @@ verify_bundle() {
 choose_bundle() {
     ask BUNDLE_DIR '本地部署包目录（解压后的目录）' "$BUNDLE_DIR" || return 1
     verify_bundle
+}
+management_installer() {
+    if [[ -f "$MANAGEMENT_DIR/install.sh" ]]; then
+        INSTALLER_FILE="$MANAGEMENT_DIR/install.sh"
+    elif [[ -f "$BUNDLE_DIR/install.sh" ]]; then
+        INSTALLER_FILE="$BUNDLE_DIR/install.sh"
+    else fail '找不到安装器，请使用完整部署入口。'; return 1; fi
 }
 
 snapshot() {
@@ -233,27 +247,46 @@ restore_files() {
         fi
     fi
 }
-restore_snapshot() {
+restore_snapshot() (
+    RESTORE_RESCUE=""; RESTORE_MUTATING=0
+    restore_interrupted() {
+        local status=$1
+        trap '' INT TERM
+        if [[ "$RESTORE_MUTATING" == 1 ]]; then
+            say '恢复已中断，正在还原操作前的快照……'
+            restore_files "$RESTORE_RESCUE" "$RESTORE_RESCUE/interrupted-restore-files" ||
+                fail "自动恢复未成功，请保留 $RESTORE_RESCUE 并检查日志。"
+        fi
+        exit "$status"
+    }
+    trap cleanup_token EXIT
+    trap 'restore_interrupted 130' INT
+    trap 'restore_interrupted 143' TERM
     local requested=$1 selected rescue
     backup_resolve "$requested" || return 1
     selected="$RESOLVED_BACKUP"
     confirm "恢复 $requested 的程序、配置和服务状态？当前状态会先备份。" || return 0
     snapshot || return 1
     rescue="$BACKUP_LAST"
+    RESTORE_RESCUE="$rescue"; RESTORE_MUTATING=1
     if restore_files "$selected" "$rescue/pre-restore-files"; then
+        RESTORE_MUTATING=0
         say '恢复完成。'
     else
         say '恢复失败，尝试恢复操作前的快照。'
         restore_files "$rescue" "$rescue/failed-restore-files" || { fail "自动恢复未成功，请保留 $rescue 并检查日志。"; return 1; }
+        RESTORE_MUTATING=0
         return 1
     fi
-}
+)
 select_backup() {
     local selected
     say "快照目录：$BACKUP_ROOT"
-    if [[ -d "$BACKUP_ROOT" ]]; then
-        find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -name 'menu-*' -printf '%f\n' | sort -r
-    fi
+    [[ -d "$BACKUP_ROOT" ]] || { fail '尚无备份，请先创建备份。'; return 1; }
+    local available
+    available=$(find "$BACKUP_ROOT" -mindepth 2 -maxdepth 2 -type f -path '*/menu-*/COMPLETE' -printf '%h\n' | sed 's@.*/@@' | sort -r) || return 1
+    [[ -n "$available" ]] || { fail '尚无完整备份。'; return 1; }
+    say "$available"
     ask selected '输入要恢复的完整快照名称' || return 1
     [[ -n "$selected" ]] || return 0
     with_lock restore_snapshot "$selected"
@@ -344,7 +377,8 @@ port_listeners() {
 }
 check_listener_ports() {
     need ss || return 1
-    local index socket listeners
+    local allow_v2bx=${1:-0} index socket listeners line names name
+    V2BX_PORT_CONFLICT=0
     for index in "${!LISTENER_PORTS[@]}"; do
         socket=tcp
         case "${LISTENER_PROTOCOLS[index]}" in hysteria|hysteria2|tuic) socket=udp ;; esac
@@ -352,7 +386,23 @@ check_listener_ports() {
         if [[ -n "$listeners" ]]; then
             say "端口 ${LISTENER_PORTS[index]}/$socket 已有监听："
             say "$listeners"
-            confirm '确认这些监听属于将被替换的实例或 V2bX，继续？（向导不会停止 Nginx/Caddy 等其他程序）' || return 1
+            while IFS= read -r line; do
+                names=$(printf '%s\n' "$line" | sed -n 's/.*users:(//p' | grep -oE '\("[^"]+"' | cut -d '"' -f 2)
+                [[ -n "$names" ]] || { fail '无法确认监听进程，请先检查并释放端口。'; return 1; }
+                while IFS= read -r name; do
+                    case "$name" in
+                        xboard-node) ;;
+                        V2bX|v2bx)
+                            [[ "$allow_v2bx" == 1 ]] && { systemctl is-active --quiet V2bX.service || systemctl is-active --quiet v2bx.service; } || {
+                                fail '请先停止旧 V2bX 或改用独立端口。'; return 1;
+                            }
+                            V2BX_PORT_CONFLICT=1
+                            ;;
+                        *) fail "端口被 $name 占用，请先停止对应旧节点或修改端口；向导不会停止其他程序。"; return 1 ;;
+                    esac
+                done <<< "$names"
+            done <<< "$listeners"
+            confirm '确认替换以上本项目实例或迁移 V2bX？' || return 1
         fi
     done
 }
@@ -423,40 +473,47 @@ prepare_deployment() {
         confirm '安装缺少的 iproute2 依赖后继续？' || return 1
         apt-get update && apt-get install -y iproute2 || return 1
     fi
-    read_topology && inspect_binding && check_listener_ports && read_certificate || return 1
+    read_topology && inspect_binding && check_listener_ports "${1:-0}" && read_certificate || return 1
     topology_guidance
 }
-install_local() {
-    local paused="" candidate result=0
+install_local() (
+    # Keep migration recovery state alive for the subshell's EXIT handler.
+    paused=""; candidate=""; result=0; committed=0
+    trap 'if [[ -n "$paused" && "$committed" == 0 ]]; then systemctl start "$paused" || fail "请手动恢复 $paused。"; fi; cleanup_token' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     need curl tar flock || return 1
     verify_bundle || return 1
+    management_installer || return 1
     say "部署模式=$MODE，目标 ID=$TARGET_ID，核心=$KERNEL；密钥不会显示。"
     confirm '确认安装或添加该实例？' || return 0
     for candidate in V2bX.service v2bx.service; do
         if systemctl is-active --quiet "$candidate"; then
             if confirm "检测到 $candidate 正在运行，是否临时停止以避免端口冲突？"; then
-                systemctl stop "$candidate" || return 1
                 paused="$candidate"
+                systemctl stop "$candidate" || return 1
+            elif [[ "$V2BX_PORT_CONFLICT" == 1 ]]; then
+                fail '旧 V2bX 仍占用节点端口，已取消部署。'; return 1
             fi
             break
         fi
     done
-    snapshot || { [[ -z "$paused" ]] || systemctl start "$paused"; return 1; }
+    snapshot || return 1
     local -a options=(install --mode "$MODE" --panel "$PANEL_URL" --token-file "$TOKEN_PATH" --kernel "$KERNEL"
         --binary "$NODE_FILE" --xbctl-binary "$CLI_FILE" --skip-dependencies)
+    if grep -q -- '--management-dir' "$INSTALLER_FILE"; then options+=(--management-dir "$MANAGEMENT_DIR"); fi
     if [[ "$MODE" == node ]]; then options+=(--node-id "$TARGET_ID" --node-type "$NODE_TYPE")
     else options+=(--machine-id "$TARGET_ID"); fi
     if [[ -n "$CERT_PROFILE_PATH" ]]; then options+=(--cert-profile "$CERT_PROFILE_PATH"); fi
-    bash "$BUNDLE_DIR/install.sh" "${options[@]}" || result=$?
+    bash "$INSTALLER_FILE" "${options[@]}" || result=$?
     if [[ "$result" == 0 ]]; then
+        committed=1
         if [[ -n "$paused" ]] && confirm "新服务已启动，是否取消 $paused 的开机自启？"; then systemctl disable "$paused" || return 1; fi
         say "配置：$INSTALL_ROOT/config.yml；日志：journalctl -u $SERVICE -f"
         say '管理菜单：xb'
-    elif [[ -n "$paused" ]]; then
-        systemctl start "$paused" || fail "请手动恢复 $paused。"
     fi
     return "$result"
-}
+)
 install_wizard() {
     if [[ ! -f "$BUNDLE_DIR/SHA256SUMS" && -f "$INSTALL_ROOT/online-install.sh" ]]; then
         say '管理目录不保存发行包。可以在线下载完整部署包后添加或重新配置实例。'
@@ -465,7 +522,7 @@ install_wizard() {
             return $?
         fi
     fi
-    choose_bundle && read_binding && prepare_deployment || { cleanup_token; return 1; }
+    choose_bundle && read_binding && prepare_deployment 1 || { cleanup_token; return 1; }
     with_lock install_local
     local result=$?
     cleanup_token
@@ -478,6 +535,8 @@ management_shortcut_owned() {
 
 online_upgrade() {
     local helper="$INSTALL_ROOT/online-install.sh" version=latest
+    [[ -f "$helper" ]] || helper="$MANAGEMENT_DIR/online-install.sh"
+    [[ -f "$helper" ]] || helper="$BUNDLE_DIR/online-install.sh"
     if [[ "${1:-}" == --version && $# == 2 ]]; then version=$2
     elif [[ $# != 0 ]]; then fail '用法：xb update [--version VERSION]'; return 1; fi
     [[ "$version" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$ ]] || { fail '版本号无效。'; return 1; }
@@ -486,14 +545,25 @@ online_upgrade() {
     # Do not hold that same lock while launching this nested deployment.
     bash "$helper" --version "$version" upgrade
 }
+update_scripts() {
+    local helper="$MANAGEMENT_DIR/online-install.sh"
+    [[ -f "$helper" ]] || helper="$INSTALL_ROOT/online-install.sh"
+    [[ -f "$helper" ]] || { fail '脚本更新入口缺失，请重新下载一键安装入口。'; return 1; }
+    [[ -x "$CLI_PATH" ]] || { fail '请先安装核心；一键安装入口会加载新版菜单。'; return 1; }
+    confirm '仅更新管理脚本，保留核心程序和配置？' || return 0
+    bash "$helper" scripts-update
+}
 
 upgrade_local() {
     [[ -f "$INSTALL_ROOT/config.yml" ]] || { fail '没有现有配置，请使用首次安装向导。'; return 1; }
     need curl || return 1
     verify_bundle || return 1
+    management_installer || return 1
     confirm '使用此部署包升级程序并重启？现有配置将保留。' || return 0
     snapshot || return 1
-    bash "$BUNDLE_DIR/install.sh" upgrade --binary "$NODE_FILE" --xbctl-binary "$CLI_FILE" --skip-dependencies || return 1
+    local -a options=(upgrade --binary "$NODE_FILE" --xbctl-binary "$CLI_FILE" --skip-dependencies)
+    if grep -q -- '--management-dir' "$INSTALLER_FILE"; then options+=(--management-dir "$MANAGEMENT_DIR"); fi
+    bash "$INSTALLER_FILE" "${options[@]}" || return 1
     say '更新完成，输入 xb 可打开管理菜单。'
 }
 upgrade_entry() {
@@ -503,7 +573,7 @@ upgrade_entry() {
         install_wizard
     else
         if [[ "$(installation_state)" == partial ]]; then say '检测到安装不完整，将保留配置并修复程序和服务。'; fi
-        verify_bundle && with_lock upgrade_local
+        with_lock upgrade_local
     fi
 }
 binding_add() {
@@ -523,7 +593,7 @@ binding_add() {
 }
 bindings_menu() {
     local choice panel id kind
-    [[ -x "$CLI_PATH" ]] || { fail '请先安装。'; return 1; }
+    [[ -x "$CLI_PATH" && -f "$INSTALL_ROOT/config.yml" ]] || { fail '请先完成安装。'; return 1; }
     "$CLI_PATH" list || return 1
     ask choice '实例：1=添加，2=移除节点，3=移除机器，0=返回' 0 || return 1
     case "$choice" in
@@ -545,6 +615,7 @@ remove_binding() {
 }
 show_status() {
     say "系统：$(uname -sr) / $(uname -m)"
+    if [[ "$(installation_state)" == fresh ]]; then say '尚未安装，请使用菜单 1 完成部署。'; return 0; fi
     [[ ! -x "$NODE_PATH" ]] || "$NODE_PATH" -v
     systemctl status "$SERVICE" --no-pager || true
     [[ ! -x "$CLI_PATH" ]] || "$CLI_PATH" list || true
@@ -552,6 +623,9 @@ show_status() {
 service_action() {
     local action=$1
     case "$action" in start|stop|restart|enable|disable) ;; *) return 1 ;; esac
+    if [[ "$action" == start || "$action" == restart || "$action" == enable ]]; then
+        [[ -x "$NODE_PATH" && -f "$INSTALL_ROOT/config.yml" ]] || { fail '程序或配置缺失，请先安装或升级修复。'; return 1; }
+    fi
     if ! service_unit_ready; then
         if [[ "$UNIT_LOAD_STATE" == masked ]]; then
             fail '服务被 systemd 屏蔽（masked），请先检查屏蔽原因。'; return 1
@@ -578,7 +652,7 @@ repair_service_unit() {
     [[ -f "$INSTALL_ROOT/config.yml" && -x "$NODE_PATH" ]] || {
         fail '程序或配置缺失，请使用菜单 1 完成安装；已有配置也可以通过菜单 2 在线升级修复。'; return 1;
     }
-    for candidate in "$BUNDLE_DIR/install.sh" "$INSTALL_ROOT/install.sh"; do
+    for candidate in "$MANAGEMENT_DIR/install.sh" "$INSTALL_ROOT/install.sh" "$BUNDLE_DIR/install.sh"; do
         if [[ -f "$candidate" ]] && bash "$candidate" help | grep -Eq '^[[:space:]]+repair[[:space:]]'; then
             installer=$candidate; break
         fi
@@ -607,7 +681,7 @@ dependencies() {
 }
 diagnose() {
     show_status
-    if command -v ss >/dev/null 2>&1; then ss -ltnp | head -25; fi
+    if command -v ss >/dev/null 2>&1; then ss -ltnp | sed -n '1,25p'; fi
     if [[ -f "$INSTALL_ROOT/config.yml" ]]; then stat -c '配置权限：%a %n' "$INSTALL_ROOT/config.yml"; fi
     say '默认转发 auto；周期计费可切换 compatible。嗅探默认为 off。'
     say '程序运行不代表面板认证和代理流量已验证，请同时检查面板在线状态。'
@@ -621,10 +695,11 @@ panel_diagnose() {
 }
 uninstall_local() {
     local purge=${1:-0} installer="$INSTALL_ROOT/install.sh"
+    [[ "$(installation_state)" != fresh ]] || { fail '尚无安装内容可卸载。'; return 1; }
+    [[ -f "$MANAGEMENT_DIR/install.sh" ]] && installer="$MANAGEMENT_DIR/install.sh"
     [[ -f "$installer" ]] || installer="$BUNDLE_DIR/install.sh"
     [[ -f "$installer" ]] || { fail '找不到安装器。'; return 1; }
     confirm '卸载程序和服务？将先保存完整备份。' || return 0
-    snapshot || return 1
     local -a options=(uninstall --yes --skip-dependencies)
     if [[ "$purge" == 1 ]]; then
         local answer
@@ -632,13 +707,73 @@ uninstall_local() {
         [[ "$answer" == DELETE ]] || { say '已取消。'; return 0; }
         options+=(--purge)
     fi
+    snapshot || return 1
     bash "$installer" "${options[@]}"
 }
+create_backup() {
+    [[ "$(installation_state)" != fresh ]] || { fail '尚无安装内容可备份。'; return 1; }
+    snapshot
+}
+show_logs() {
+    need journalctl || return 1
+    if [[ "$(installation_state)" == fresh ]]; then say '尚未安装，仅查询可能保留的历史日志。'; fi
+    case "${1:-recent}" in
+        recent) journalctl -u "$SERVICE" -n 80 --no-pager ;;
+        follow) journalctl -u "$SERVICE" -n 80 -f ;;
+        *) fail '用法：xb logs [-f|--follow]'; return 1 ;;
+    esac
+}
+logs_menu() {
+    local choice
+    ask choice '日志：1=最近 80 行，2=实时跟踪（Ctrl+C 返回），0=返回' 1 || return 1
+    case "$choice" in 0) return 0 ;; 1) show_logs recent ;; 2) show_logs follow ;; *) fail '日志选项无效。'; return 1 ;; esac
+}
+menu_dispatch() {
+    case "$1" in
+        1) install_wizard ;;
+        2) online_upgrade ;;
+        3) show_status ;;
+        4) with_lock service_action start ;;
+        5) with_lock service_action stop ;;
+        6) with_lock service_action restart ;;
+        7) logs_menu ;;
+        8) with_lock edit_config ;;
+        9) bindings_menu ;;
+        10) with_lock create_backup ;;
+        11) select_backup ;;
+        12) diagnose ;;
+        13) with_lock dependencies ;;
+        14) with_lock uninstall_local 0 ;;
+        15) with_lock uninstall_local 1 ;;
+        16) with_lock service_action enable ;;
+        17) with_lock service_action disable ;;
+        18) choose_bundle && upgrade_entry ;;
+        19) panel_diagnose ;;
+        20) with_lock repair_service_unit ;;
+        21) update_scripts ;;
+        *) fail '请选择菜单中的编号。'; return 1 ;;
+    esac
+}
+run_menu_action() (
+    trap cleanup_token EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    menu_dispatch "$1"
+)
+read_menu_choice() {
+    # Readline can keep reading after a handled SIGINT. Return from the input
+    # function explicitly so cancellation cannot dispatch a partially typed ID.
+    trap 'MENU_INTERRUPTED=1; return 130' INT
+    read_input "$@"
+}
 menu() {
-    local choice log_choice
+    local choice result state_label
+    trap 'MENU_INTERRUPTED=1' INT
     while true; do
+        MENU_INTERRUPTED=0
         printf '\n%s\n' '========== Xboard-Node 部署管理 =========='
-        say "安装状态：$(installation_state)；配置目录：$INSTALL_ROOT"
+        case "$(installation_state)" in installed) state_label=已安装 ;; partial) state_label=安装不完整 ;; *) state_label=未安装 ;; esac
+        say "安装状态：$state_label；配置目录：$INSTALL_ROOT"
         say ' 1. 本地安装 / 部署向导（节点或机器模式）'
         say ' 2. 在线更新至最新正式版（保留配置）'
         say ' 3. 查看状态 / 版本 / 实例'
@@ -649,77 +784,70 @@ menu() {
         say '16. 开机自启     17. 取消自启     18. 本地包升级'
         say '19. 面板 / TLS / CDN 配置预检'
         say '20. 修复服务注册并启动（保留配置和程序）'
+        say '21. 仅更新管理脚本（不更新核心、不重启）'
         say ' 0. 退出'
-        read_input choice '请选择: ' || return 0
-        case "$choice" in
-            0) return 0 ;;
-            1) install_wizard || say '部署未完成，请检查上方信息。' ;;
-            2) online_upgrade || say '更新未完成，请检查上方信息。' ;;
-            3) show_status ;;
-            4) with_lock service_action start || true ;;
-            5) with_lock service_action stop || true ;;
-            6) with_lock service_action restart || true ;;
-            7)
-                ask log_choice '日志：1=最近 80 行，2=实时跟踪（Ctrl+C 返回）' 1 || continue
-                if [[ "$log_choice" == 2 ]]; then journalctl -u "$SERVICE" -f || true
-                else journalctl -u "$SERVICE" -n 80 --no-pager || true; fi
-                ;;
-            8) with_lock edit_config || true ;;
-            9) bindings_menu || true ;;
-            10) with_lock snapshot || true ;;
-            11) select_backup || true ;;
-            12) diagnose ;;
-            13) with_lock dependencies || true ;;
-            14) with_lock uninstall_local 0 || true ;;
-            15) with_lock uninstall_local 1 || true ;;
-            16) with_lock service_action enable || true ;;
-            17) with_lock service_action disable || true ;;
-            18) choose_bundle && upgrade_entry || say '升级未完成，请检查上方信息。' ;;
-            19) panel_diagnose || say '预检未通过，请检查上方信息。' ;;
-            20) with_lock repair_service_unit || say '修复未完成，请检查上方信息。' ;;
-            *) say '请选择菜单中的编号。' ;;
-        esac
+        result=0
+        read_menu_choice choice '请选择: ' || result=$?
+        trap 'MENU_INTERRUPTED=1' INT
+        if [[ "$result" != 0 || "$MENU_INTERRUPTED" == 1 ]]; then
+            if [[ "$MENU_INTERRUPTED" == 1 ]]; then printf '\n已取消输入，返回菜单。\n'; continue; fi
+            return 0
+        fi
+        [[ "$choice" != 0 ]] || return 0
+        result=0
+        run_menu_action "$choice" || result=$?
+        if [[ "$result" == 130 || "$MENU_INTERRUPTED" == 1 ]]; then
+            printf '\n已中断当前操作，返回菜单。\n'
+        elif [[ "$result" != 0 ]]; then
+            say "操作未完成（退出码 $result），请检查上方信息。"
+        elif [[ "$choice" == 2 || "$choice" == 21 ]]; then
+            if [[ -f "$INSTALL_ROOT/deploy.sh" ]]; then exec bash "$INSTALL_ROOT/deploy.sh" menu; fi
+        fi
     done
 }
 usage() {
     cat <<'HELP'
-Usage: sudo bash deploy.sh [--bundle-dir DIR] [COMMAND]
+Usage: sudo bash deploy.sh [--bundle-dir DIR] [--management-dir DIR] [COMMAND]
 Shortcut: xb (menu), xb update [--version TAG], xb logs, xb uninstall
   menu (default), install, upgrade, status, check, start, stop, restart,
-  logs, backup, restore BACKUP_NAME, bindings, edit, deps, preflight, repair, uninstall, purge
+  logs, backup, restore BACKUP_NAME, bindings, edit, deps, preflight, repair, uninstall, purge,
+  scripts-update (scripts only; preserves binaries, config and running service)
 Local bundles must include both binaries, install.sh, deploy.sh and SHA256SUMS.
 Snapshots are retained under /var/backups/xboard-node, including after purge.
 HELP
 }
 main() {
     local command=menu
-    if [[ "${1:-}" == --bundle-dir ]]; then
+    while [[ "${1:-}" == --bundle-dir || "${1:-}" == --management-dir ]]; do
         [[ $# -ge 2 ]] || { usage; return 1; }
-        BUNDLE_DIR=$2; shift 2
-    fi
+        if [[ "$1" == --bundle-dir ]]; then BUNDLE_DIR=$2; else MANAGEMENT_DIR=$2; fi
+        shift 2
+    done
     command=${1:-menu}
     if [[ $# -gt 0 ]]; then shift; fi
     case "$command" in help|-h|--help) usage; return 0 ;; esac
     linux_only && systemd_only || return 1
     if [[ "$command" != status && "$command" != check ]]; then root_only || return 1; fi
     trap cleanup_token EXIT
-    trap 'cleanup_token; printf "\n已中断当前操作。\n"' INT
+    trap 'cleanup_token; exit 130' INT
     trap 'cleanup_token; exit 143' TERM
     case "$command" in
         menu) menu ;;
         install) install_wizard ;;
         upgrade) upgrade_entry ;;
         online-upgrade|update) online_upgrade "$@" ;;
+        scripts-update) update_scripts ;;
         status) show_status ;;
         check) diagnose ;;
         preflight) panel_diagnose ;;
         repair) with_lock repair_service_unit ;;
         start|stop|restart) with_lock service_action "$command" ;;
         logs|log)
-            if [[ "${1:-}" == -f || "${1:-}" == --follow ]]; then journalctl -u "$SERVICE" -n 80 -f
-            else journalctl -u "$SERVICE" -n 80 --no-pager; fi
+            if [[ $# == 0 ]]; then show_logs recent
+            elif [[ $# == 1 && ( "$1" == -f || "$1" == --follow ) ]]; then show_logs follow
+            else fail '用法：xb logs [-f|--follow]'; return 1; fi
             ;;
-        backup) with_lock snapshot ;;
+        backup) with_lock create_backup ;;
         restore)
             [[ $# == 1 ]] || { usage; return 1; }
             with_lock restore_snapshot "$1"

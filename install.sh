@@ -22,6 +22,7 @@ CLI_PATH="/usr/local/bin/xbctl"
 SHORTCUT_PATH="/usr/local/bin/xb"
 INSTALLER_COPY_PATH="${INSTALL_ROOT}/install.sh"
 INSTALLER_SOURCE_PATH="${BASH_SOURCE[0]:-}"
+MANAGEMENT_SOURCE_DIR=""
 DEFAULT_RAW_BASE="https://raw.githubusercontent.com/kirakirai8023/Xboard-Node"
 CLI_BINARY_SOURCE=""
 DEFAULT_HEALTH_PORT=65530
@@ -61,6 +62,8 @@ CURRENT_STATE="fresh"
 TMP_DIR=""
 BACKUP_PATH=""
 SERVICE_EXISTED=0
+SERVICE_WAS_ACTIVE=0
+SERVICE_WAS_ENABLED=0
 CLEANUP_DONE=0
 MUTATION_STARTED=0
 
@@ -102,6 +105,7 @@ load_health_port_from_config() {
 
 rollback_install() {
     log_warn "Rolling back installation"
+    systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
     if [ -n "$BACKUP_PATH" ] && [ -d "$BACKUP_PATH" ]; then
         if [ -f "$BACKUP_PATH/xboard-node" ]; then
             install -m 755 "$BACKUP_PATH/xboard-node" "$BINARY_PATH"
@@ -150,12 +154,16 @@ rollback_install() {
     load_health_port_from_config "$CONFIG_FILE"
     systemctl daemon-reload || true
     if [ "$SERVICE_EXISTED" -eq 1 ] || [ -f "$SERVICE_PATH" ]; then
-        systemctl reset-failed "$SERVICE_NAME" >/dev/null 2>&1 || true
-        systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true
-        if ! wait_for_health; then
-            log_error "Rollback completed but restored service did not become healthy"
-            show_recent_logs
-            return 1
+        if [[ "$SERVICE_WAS_ENABLED" == 1 ]]; then systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || return 1
+        else systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || return 1; fi
+        if [[ "$SERVICE_WAS_ACTIVE" == 1 ]]; then
+            systemctl reset-failed "$SERVICE_NAME" >/dev/null 2>&1 || true
+            systemctl start "$SERVICE_NAME" >/dev/null 2>&1 || return 1
+            if ! wait_for_health; then
+                log_error "Rollback completed but restored service did not become healthy"
+                show_recent_logs
+                return 1
+            fi
         fi
     else
         systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
@@ -224,6 +232,7 @@ usage() {
     --version           Release version or latest (default: latest)
     --binary            Use a local xboard-node binary path instead of downloading
     --xbctl-binary      Use a local xbctl binary path instead of downloading
+    --management-dir    Use a complete, explicitly selected management script set
     --skip-dependencies Use already-installed dependencies (local/offline deployment)
     --health-port       Local health port (default: 65530, use 0 to disable)
     --gomemlimit        Runtime GOMEMLIMIT value, e.g. 256MiB
@@ -267,6 +276,11 @@ parse_args() {
                 ;;
             --cert-profile)
                 CERT_PROFILE="$2"
+                shift 2
+                ;;
+            --management-dir)
+                [[ $# -ge 2 && -n "$2" ]] || { log_error 'Missing management script directory'; return 1; }
+                MANAGEMENT_SOURCE_DIR=$2
                 shift 2
                 ;;
             --skip-dependencies)
@@ -615,16 +629,23 @@ stage_management_tools() {
         return 1
     fi
     local source_dir="" ref="" helper
-    if [[ -f "$INSTALLER_SOURCE_PATH" ]]; then
+    if [[ -n "$MANAGEMENT_SOURCE_DIR" ]]; then
+        source_dir=$(cd -- "$MANAGEMENT_SOURCE_DIR" && pwd -P) || return 1
+    elif [[ -f "$INSTALLER_SOURCE_PATH" ]]; then
         source_dir=$(cd -- "$(dirname -- "$INSTALLER_SOURCE_PATH")" && pwd -P)
     fi
     # Installed helpers belong to the previous release, not the staged binaries.
-    if [[ -n "$source_dir" && "$source_dir" -ef "$INSTALL_ROOT" ]]; then
+    if [[ -z "$MANAGEMENT_SOURCE_DIR" && -n "$source_dir" && "$source_dir" -ef "$INSTALL_ROOT" ]]; then
         source_dir=""
     fi
     for helper in install.sh deploy.sh online-install.sh xb; do
-        if [[ -n "$source_dir" && -f "$source_dir/$helper" ]]; then
+        if [[ -n "$source_dir" && -f "$source_dir/$helper" && ! -L "$source_dir/$helper" ]]; then
             cp -- "$source_dir/$helper" "$TMP_DIR/$helper"
+        elif [[ -n "$MANAGEMENT_SOURCE_DIR" && "$source_dir" -ef "$INSTALL_ROOT" && "$helper" == xb ]] && management_shortcut_owned; then
+            cp -- "$SHORTCUT_PATH" "$TMP_DIR/$helper"
+        elif [[ -n "$MANAGEMENT_SOURCE_DIR" ]]; then
+            log_error "Explicit management directory is missing regular file $helper"
+            return 1
         else
             if [[ -z "$ref" ]]; then
                 ref="$RELEASE_VERSION"
@@ -731,8 +752,11 @@ EOF_UNIT
 }
 
 backup_existing_state() {
-    BACKUP_PATH="${BACKUP_DIR}/$(date +%Y%m%d-%H%M%S)"
-    mkdir -p "$BACKUP_PATH"
+    install -d -m 700 "$BACKUP_DIR"
+    BACKUP_PATH=$(mktemp -d "${BACKUP_DIR}/$(date +%Y%m%d-%H%M%S)-XXXXXXXX")
+    SERVICE_WAS_ACTIVE=0; SERVICE_WAS_ENABLED=0
+    if systemctl is-active --quiet "$SERVICE_NAME"; then SERVICE_WAS_ACTIVE=1; fi
+    if systemctl is-enabled --quiet "$SERVICE_NAME"; then SERVICE_WAS_ENABLED=1; fi
     if [ -x "$BINARY_PATH" ]; then
         cp "$BINARY_PATH" "$BACKUP_PATH/xboard-node"
     fi
@@ -764,6 +788,15 @@ backup_existing_state() {
 stop_existing_service() {
     if [ -f "$SERVICE_PATH" ] || systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1; then
         systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+    fi
+}
+
+validate_service_target() {
+    local load_state
+    load_state=$(systemctl show --property=LoadState --value "$SERVICE_NAME" 2>/dev/null) || true
+    if [[ "$load_state" == masked || -L "$SERVICE_PATH" ]]; then
+        log_error 'Refusing to replace a masked or symlinked service; inspect the existing unit first'
+        return 1
     fi
 }
 
@@ -825,6 +858,7 @@ start_service() {
 perform_install() {
     validate_install_request
     detect_current_state
+    validate_service_target
     require_reconfigure_confirmation
     TMP_DIR=$(mktemp -d)
     ensure_dirs
@@ -852,6 +886,7 @@ perform_install() {
 
 perform_upgrade() {
     detect_current_state
+    validate_service_target
     if [ "$CURRENT_STATE" = "fresh" ]; then
         log_warn "No existing install found; falling back to install"
         perform_install
