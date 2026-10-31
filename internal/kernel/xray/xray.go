@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	stdtls "crypto/tls"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -67,11 +68,21 @@ type Xray struct {
 	lastKernelHash  string
 	cumTraffic      map[int][2]int64
 	statsUsers      map[int]struct{}
+	retiredStats    []trafficSource
 	speedLimitFunc  func(string) *rate.Limiter
 
 	// running is set after a successful Start and cleared before shutdown.
 	// Atomic so IsRunning / GetConnections never block.
 	running atomic.Bool
+}
+
+// Closed or draining instances can publish final counters after replacement.
+// Keep their managers until shutdown completes and the next stats collection.
+type trafficSource struct {
+	manager stats.Manager
+	users   map[int]struct{}
+	done    <-chan struct{}
+	stop    context.CancelFunc
 }
 
 func New(cfg config.KernelConfig) *Xray {
@@ -116,6 +127,9 @@ func (x *Xray) Protocols() []string {
 //	Phase 4 – Swap:       store new, extract old     (brief kernel lock)
 //	Phase 5 – RecycleOld: close old in background    (non-blocking)
 func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
+	if err := validateTLSMaterial(nodeConfig, tls); err != nil {
+		return err
+	}
 	// ── Phase 1: Build config (no shared state) ─────────────────────────
 	x.ensureGeoData(nodeConfig)
 
@@ -162,6 +176,13 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 	old := x.instance
 	oldLD := x.limitDispatcher
 	oldCancel := x.cancel
+	oldDone := make(chan struct{})
+	drainCtx, stopDrain := context.WithCancel(context.Background())
+	if old != nil {
+		x.retainStats(old, oldDone, stopDrain)
+	} else {
+		stopDrain()
+	}
 	x.instance = inst
 	x.cancel = cancel
 	x.limitDispatcher = ld
@@ -170,7 +191,6 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 	x.tls = tls
 	x.protocol = nodeConfig.Protocol
 	x.inboundTag = nodeConfig.Protocol + "-in"
-	x.cumTraffic = make(map[int][2]int64)
 	x.statsUsers = make(map[int]struct{}, len(users))
 	for _, u := range users {
 		x.statsUsers[u.ID] = struct{}{}
@@ -180,7 +200,7 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 	x.mu.Unlock()
 
 	// ── Phase 5: Recycle old (background, non-blocking) ─────────────────
-	closeOld(old, oldLD, oldCancel)
+	closeOld(drainCtx, old, oldLD, oldCancel, oldDone)
 
 	x.updateDispatcherLimits(users)
 	x.updateBandwidthLimits(users)
@@ -197,6 +217,9 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 // instance restart for most transport/TLS settings, it triggers a full restart
 // if any kernel-affecting fields (hash mismatch) have changed.
 func (x *Xray) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
+	if err := validateTLSMaterial(nodeConfig, tls); err != nil {
+		return err
+	}
 	x.updateDispatcherLimits(users)
 	x.updateBandwidthLimits(users)
 
@@ -210,9 +233,22 @@ func (x *Xray) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ke
 		nlog.Core().Debug("xray: limits updated, kernel configuration unchanged")
 		return nil
 	}
+	oldNode, oldUsers, oldTLS := x.nodeConfig, x.users, x.tls
 	x.mu.Unlock()
 
 	nlog.Core().Info("xray: configuration changed, performing full restart")
+	if oldNode != nil && oldNode.ServerPort == nodeConfig.ServerPort {
+		// A replacement cannot bind a port still owned by the old instance.
+		// This includes certificate renewals. Roll back if the new build fails.
+		x.Stop()
+		if err := x.Start(nodeConfig, users, tls); err != nil {
+			if restoreErr := x.Start(oldNode, oldUsers, oldTLS); restoreErr != nil {
+				return fmt.Errorf("%w; restore previous xray instance: %v", err, restoreErr)
+			}
+			return err
+		}
+		return nil
+	}
 	return x.Start(nodeConfig, users, tls)
 }
 
@@ -225,11 +261,21 @@ func (x *Xray) Stop() {
 	inst := x.instance
 	ld := x.limitDispatcher
 	cancel := x.cancel
+	retired := append([]trafficSource(nil), x.retiredStats...)
+	done := make(chan struct{})
+	if inst != nil {
+		x.retainStats(inst, done, nil)
+	}
 	x.instance = nil
 	x.limitDispatcher = nil
 	x.cancel = nil
 	x.mu.Unlock()
 
+	for _, source := range retired {
+		if source.stop != nil {
+			source.stop()
+		}
+	}
 	if cancel != nil {
 		cancel()
 	}
@@ -241,12 +287,25 @@ func (x *Xray) Stop() {
 	if ld != nil {
 		ld.ResetConns()
 	}
+	close(done)
+	for _, source := range retired {
+		<-source.done
+	}
 }
 
 func (x *Xray) IsRunning() bool { return x.running.Load() }
 
 func tlsEqual(a, b kernel.TLSCert) bool {
 	return bytes.Equal(a.CertPEM, b.CertPEM) && bytes.Equal(a.KeyPEM, b.KeyPEM)
+}
+
+func validateTLSMaterial(node *model.NodeSpec, material kernel.TLSCert) error {
+	if node.TLS == 1 || node.Protocol == "hysteria" {
+		if _, err := stdtls.X509KeyPair(material.CertPEM, material.KeyPEM); err != nil {
+			return fmt.Errorf("invalid inbound TLS certificate: %w", err)
+		}
+	}
+	return nil
 }
 
 // ─── Observability ──────────────────────────────────────────────────────────
@@ -256,10 +315,6 @@ func tlsEqual(a, b kernel.TLSCert) bool {
 // available. Traffic accounting stays in xray-core, including native copies
 // that bypass the node's limiter-compatible wrappers.
 func (x *Xray) GetUserTraffic(_ context.Context) (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, connCount int, err error) {
-	if !x.running.Load() {
-		return nil, nil, 0, nil
-	}
-
 	x.mu.Lock()
 	ld := x.limitDispatcher
 	traffic, err = x.aggregateStats()
@@ -722,8 +777,9 @@ func startWithTimeout(inst *xrayCore.Instance, timeout time.Duration) error {
 // closeOld shuts down a previously running instance and its dispatcher.
 // Recycling happens in a background goroutine to prevent the main thread
 // from blocking on slow connection draining, enabling "hitless" reload.
-func closeOld(inst *xrayCore.Instance, ld *LimitDispatcher, cancel context.CancelFunc) {
+func closeOld(ctx context.Context, inst *xrayCore.Instance, ld *LimitDispatcher, cancel context.CancelFunc, done chan<- struct{}) {
 	if inst == nil {
+		close(done)
 		if cancel != nil {
 			cancel()
 		}
@@ -734,11 +790,12 @@ func closeOld(inst *xrayCore.Instance, ld *LimitDispatcher, cancel context.Cance
 		_ = manager.Close()
 	}
 	go func() {
+		defer close(done)
 		// 1. Drain connections gracefully (best effort, e.g. 5 minutes)
 		// Superseded listeners are already closed. Existing sessions may drain
 		// in the background while the replacement accepts new connections.
 		if ld != nil {
-			drainConns(ld, 5*time.Minute)
+			drainConns(ctx, ld, 5*time.Minute)
 		}
 		// 2. Hard close
 		if cancel != nil {
@@ -753,40 +810,83 @@ func closeOld(inst *xrayCore.Instance, ld *LimitDispatcher, cancel context.Cance
 }
 
 // drainConns waits up to timeout for the dispatcher's active connections to
-// reach zero. Used only during graceful Stop, not during hot-reload.
-func drainConns(ld *LimitDispatcher, timeout time.Duration) {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if ld.connCount.Load() == 0 {
+// reach zero during replacement. Stop cancels the drain immediately.
+func drainConns(ctx context.Context, ld *LimitDispatcher, timeout time.Duration) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for ld.connCount.Load() != 0 {
+		select {
+		case <-ctx.Done():
 			return
+		case <-timer.C:
+			return
+		case <-ticker.C:
 		}
-		time.Sleep(100 * time.Millisecond)
 	}
 }
 
-// aggregateStats is a fallback path that reads xray's built-in stats counters
-// when LimitDispatcher is not available. Returns per-user cumulative traffic.
+// aggregateStats reads active and retired instances' built-in stats counters.
+// Returns per-user cumulative traffic across reloads and stops.
 // Must be called with x.mu held.
 func (x *Xray) aggregateStats() (map[int][2]int64, error) {
-	sm := x.instance.GetFeature(stats.ManagerType())
-	if sm == nil {
-		return nil, nil
-	}
-	mgr, ok := sm.(stats.Manager)
-	if !ok {
-		return nil, nil
-	}
-
-	traffic := make(map[int][2]int64)
 	if x.statsUsers == nil {
 		x.statsUsers = make(map[int]struct{})
 	}
 	for _, u := range x.users {
 		x.statsUsers[u.ID] = struct{}{}
 	}
+	if x.instance != nil {
+		if mgr, ok := x.instance.GetFeature(stats.ManagerType()).(stats.Manager); ok {
+			x.collectStats(mgr, x.statsUsers)
+		}
+	}
+	remaining := x.retiredStats[:0]
+	for _, source := range x.retiredStats {
+		// Check completion before collecting, so a concurrently completed
+		// source is collected once more on the following tick.
+		finished := false
+		select {
+		case <-source.done:
+			finished = true
+		default:
+		}
+		if source.manager != nil {
+			x.collectStats(source.manager, source.users)
+		}
+		if !finished {
+			remaining = append(remaining, source)
+		} else if source.stop != nil {
+			source.stop()
+		}
+	}
+	clear(x.retiredStats[len(remaining):])
+	x.retiredStats = remaining
+	traffic := make(map[int][2]int64, len(x.cumTraffic))
+	for uid, total := range x.cumTraffic {
+		traffic[uid] = total
+	}
+	return traffic, nil
+}
+
+// retainStats must be called before replacing instance-specific bookkeeping.
+func (x *Xray) retainStats(inst *xrayCore.Instance, done <-chan struct{}, stop context.CancelFunc) {
+	mgr, _ := inst.GetFeature(stats.ManagerType()).(stats.Manager)
+	users := make(map[int]struct{}, len(x.statsUsers)+len(x.users))
+	for uid := range x.statsUsers {
+		users[uid] = struct{}{}
+	}
+	for _, user := range x.users {
+		users[user.ID] = struct{}{}
+	}
+	x.retiredStats = append(x.retiredStats, trafficSource{manager: mgr, users: users, done: done, stop: stop})
+}
+
+func (x *Xray) collectStats(mgr stats.Manager, users map[int]struct{}) {
 	// A splice counter may be flushed when the connection exits. Keep
 	// polling revoked users so their final bytes are not lost.
-	for uid := range x.statsUsers {
+	for uid := range users {
 		email := userEmail(uid)
 
 		var dUp, dDown int64
@@ -804,11 +904,7 @@ func (x *Xray) aggregateStats() (map[int][2]int64, error) {
 			x.cumTraffic[uid] = cum
 		}
 
-		if cum := x.cumTraffic[uid]; cum[0] > 0 || cum[1] > 0 {
-			traffic[uid] = cum
-		}
 	}
-	return traffic, nil
 }
 
 // updateBandwidthLimits connects the local dispatcher to the shared limiters.

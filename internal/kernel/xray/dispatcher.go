@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"reflect"
-	"sort"
 	"sync"
 	"sync/atomic"
 	_ "unsafe"
@@ -72,7 +71,7 @@ type LimitDispatcher struct {
 	innerDisp routing.Dispatcher // same object, typed as Dispatcher
 
 	// limitedUsers: users with device limit > 0, protected by mu.
-	// Needs deterministic IP ordering for kick decisions.
+	// Admission and slot reservation use the same lock for TCP and UDP.
 	mu           sync.RWMutex
 	limitedIPs   map[string]map[string]int // email → sourceIP → refcount
 	deviceLimits map[string]int            // email → max devices
@@ -83,7 +82,7 @@ type LimitDispatcher struct {
 	compatible   bool // immutable after the instance starts
 	closed       bool
 
-	// unlimitedIPs: users without device limit — sync.Map for lock-free access.
+	// unlimitedIPs retains occupancy across device-limit policy changes.
 	// Each entry is *ipCounter{ips sync.Map}.
 	unlimitedIPs sync.Map // email → *ipCounter
 
@@ -126,9 +125,7 @@ func (d *LimitDispatcher) Dispatch(ctx context.Context, dest net.Destination) (*
 		link, err := d.innerDisp.Dispatch(ctx, dest)
 		if err != nil {
 			cancel()
-			if isTCP {
-				d.delConn(email, sourceIP)
-			}
+			d.delConn(email, sourceIP)
 			return nil, err
 		}
 		if !d.trackManagedLink(ctx, cancel, link, email, sourceIP, isTCP, true) {
@@ -277,9 +274,7 @@ func (d *LimitDispatcher) trackManagedLink(ctx context.Context, cancel context.C
 	onClose := func() {
 		once.Do(func() {
 			cancel()
-			if isTCP {
-				d.delConn(email, sourceIP)
-			}
+			d.delConn(email, sourceIP)
 			d.connCount.Add(-1)
 			d.mu.Lock()
 			delete(d.connections[email], record)
@@ -310,9 +305,7 @@ func (d *LimitDispatcher) trackManagedLink(ctx context.Context, cancel context.C
 		}
 		common.Interrupt(reader)
 		common.Interrupt(writer)
-		if isTCP {
-			d.delConn(email, sourceIP)
-		}
+		d.delConn(email, sourceIP)
 		return false
 	}
 	d.connCount.Add(1)
@@ -457,116 +450,74 @@ func (d *LimitDispatcher) GetConnectionState() (aliveIPs map[int]map[string]bool
 
 // ─── Internal helpers ───────────────────────────────────────────────────────
 
-// checkDeviceLimit enforces per-user device limits.
-// Fast path: unlimited users use lock-free sync.Map.
-// Slow path: limited users use RWMutex with deterministic IP ordering.
-func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string, isTCP bool) bool {
-	d.mu.RLock()
-	limit, hasLimit := d.deviceLimits[email]
-	d.mu.RUnlock()
-
-	// Fast path: no device limit — use lock-free sync.Map.
-	if !hasLimit || limit <= 0 {
-		if isTCP {
-			v, _ := d.unlimitedIPs.LoadOrStore(email, &ipCounter{})
-			ic := v.(*ipCounter)
-
-			// Increment IP refcount atomically.
-			rv, _ := ic.ips.LoadOrStore(sourceIP, &atomic.Int64{})
-			rv.(*atomic.Int64).Add(1)
-		}
-		return false
-	}
-
-	// Slow path: user has device limit — need deterministic ordering.
-	d.mu.RLock()
-	ips := d.limitedIPs[email]
-	if ips != nil && ips[sourceIP] > 0 {
-		d.mu.RUnlock()
-		if isTCP {
-			d.mu.Lock()
-			d.limitedIPs[email][sourceIP]++
-			d.mu.Unlock()
-		}
-		return false
-	}
-
-	if ips != nil && len(ips) < limit {
-		d.mu.RUnlock()
-		if isTCP {
-			d.mu.Lock()
-			if d.limitedIPs[email] == nil {
-				d.limitedIPs[email] = make(map[string]int)
-			}
-			d.limitedIPs[email][sourceIP]++
-			d.mu.Unlock()
-		}
-		return false
-	}
-	d.mu.RUnlock()
-
-	// Over limit — need write lock for deterministic check.
+// checkDeviceLimit atomically checks and reserves a source-IP slot. Existing
+// sessions remain valid when a limit changes; new distinct IPs cannot exceed it.
+func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string, _ bool) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-
-	// Re-check under write lock.
-	ips = d.limitedIPs[email]
-	if ips == nil {
-		ips = make(map[string]int)
-		d.limitedIPs[email] = ips
+	if d.closed {
+		return true
 	}
-
-	if ips[sourceIP] > 0 {
-		if isTCP {
-			ips[sourceIP]++
-		}
-		return false
+	limit := d.deviceLimits[email]
+	ips := d.limitedIPs[email]
+	var unlimited *ipCounter
+	if value, ok := d.unlimitedIPs.Load(email); ok {
+		unlimited = value.(*ipCounter)
 	}
-
-	if len(ips) < limit {
-		if isTCP {
-			ips[sourceIP]++
-		}
-		return false
-	}
-
-	// Over limit — deterministic: allow lowest IPs lexicographically.
-	ipList := make([]string, 0, len(ips)+1)
-	for ip := range ips {
-		ipList = append(ipList, ip)
-	}
-	ipList = append(ipList, sourceIP)
-	sort.Strings(ipList)
-
-	for i := 0; i < limit && i < len(ipList); i++ {
-		if ipList[i] == sourceIP {
-			if isTCP {
-				ips[sourceIP]++
-			}
+	if unlimited != nil {
+		if value, ok := unlimited.ips.Load(sourceIP); ok {
+			value.(*atomic.Int64).Add(1)
 			return false
 		}
 	}
-	return true
+	if ips[sourceIP] > 0 {
+		ips[sourceIP]++
+		return false
+	}
+	if limit > 0 {
+		count := len(ips)
+		if unlimited != nil {
+			unlimited.ips.Range(func(ip, _ any) bool {
+				if ips[ip.(string)] == 0 {
+					count++
+				}
+				return true
+			})
+		}
+		if count >= limit {
+			return true
+		}
+	}
+	if limit <= 0 {
+		value, _ := d.unlimitedIPs.LoadOrStore(email, &ipCounter{})
+		counter := &atomic.Int64{}
+		counter.Store(1)
+		value.(*ipCounter).ips.Store(sourceIP, counter)
+	} else {
+		if ips == nil {
+			ips = make(map[string]int)
+			d.limitedIPs[email] = ips
+		}
+		ips[sourceIP]++
+	}
+	return false
 }
 
-// delConn decrements the IP refcount when a connection closes.
+// delConn releases either a TCP or UDP slot, including sessions created before
+// the user's device-limit policy changed.
 func (d *LimitDispatcher) delConn(email, sourceIP string) {
-	// Check if this is an unlimited user first (lock-free).
-	if v, ok := d.unlimitedIPs.Load(email); ok {
-		ic := v.(*ipCounter)
-		if rv, ok := ic.ips.Load(sourceIP); ok {
-			counter := rv.(*atomic.Int64)
-			if counter.Add(-1) <= 0 {
-				ic.ips.Delete(sourceIP)
-			}
-		}
-		return
-	}
-
-	// Limited user — use write lock.
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if ips, ok := d.limitedIPs[email]; ok {
+	if value, ok := d.unlimitedIPs.Load(email); ok {
+		ic := value.(*ipCounter)
+		if value, ok := ic.ips.Load(sourceIP); ok {
+			if value.(*atomic.Int64).Add(-1) <= 0 {
+				ic.ips.Delete(sourceIP)
+			}
+			return
+		}
+	}
+	if ips := d.limitedIPs[email]; ips != nil {
 		ips[sourceIP]--
 		if ips[sourceIP] <= 0 {
 			delete(ips, sourceIP)

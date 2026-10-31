@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/kirakirai8023/Xboard-Node/internal/config"
 	"github.com/kirakirai8023/Xboard-Node/internal/model"
@@ -55,6 +56,35 @@ func newStatsBackedXray(t *testing.T, users []model.UserSpec, ld *LimitDispatche
 	x.cumTraffic = make(map[int][2]int64)
 	x.running.Store(true)
 	return x, mgr
+}
+
+func TestXrayStop_ClosesDrainingInstancesAndCollectsFinalTraffic(t *testing.T) {
+	x, mgr := newStatsBackedXray(t, []model.UserSpec{{ID: 1}}, nil)
+	oldManager := newStatsManager(t)
+	oldUp := mustRegisterCounter(t, oldManager, counterName(1, "uplink"))
+	currentUp := mustRegisterCounter(t, mgr, counterName(1, "uplink"))
+	currentUp.Add(50)
+	drainCtx, stopDrain := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	x.retiredStats = append(x.retiredStats, trafficSource{
+		manager: oldManager, users: map[int]struct{}{1: {}}, done: done, stop: stopDrain,
+	})
+	go func() {
+		<-drainCtx.Done()
+		oldUp.Add(100)
+		close(done)
+	}()
+	stopped := make(chan struct{})
+	go func() { x.Stop(); close(stopped) }()
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not cancel background draining")
+	}
+	traffic, _, _, err := x.GetUserTraffic(context.Background())
+	if err != nil || traffic[1][0] != 150 || len(x.retiredStats) != 0 {
+		t.Fatalf("final counters=%v, retained sources=%d, error=%v", traffic, len(x.retiredStats), err)
+	}
 }
 
 func TestXrayGetUserTrafficUsesBuiltInStatsAndDispatcherState(t *testing.T) {
@@ -130,6 +160,21 @@ func TestXrayTraffic_RevokedUserFinalCounters(t *testing.T) {
 	traffic, _, _, err := x.GetUserTraffic(context.Background())
 	if err != nil || traffic[1][1] != 12345 {
 		t.Fatalf("late counter flush = %v, %v", traffic, err)
+	}
+}
+
+func TestXrayTraffic_FinalCountersRemainReadableAfterStop(t *testing.T) {
+	x, mgr := newStatsBackedXray(t, []model.UserSpec{{ID: 1, UUID: "u"}}, nil)
+	counter := mustRegisterCounter(t, mgr, counterName(1, "downlink"))
+	counter.Add(100)
+	_, _, _, _ = x.GetUserTraffic(context.Background())
+	counter.Add(50)
+	x.Stop()
+	for i := 0; i < 2; i++ {
+		traffic, _, count, err := x.GetUserTraffic(context.Background())
+		if err != nil || traffic[1][1] != 150 || count != 0 {
+			t.Fatalf("final traffic=%v, count=%d, error=%v", traffic, count, err)
+		}
 	}
 }
 

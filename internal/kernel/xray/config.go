@@ -588,8 +588,7 @@ func applyStreamSettings(base M, nc *model.NodeSpec, tc kernel.TLSCert) {
 				// xray rejects [] for fields that expect objects (e.g. sockopt, tlsSettings).
 				// Recursively strip empty arrays from the extra map before passing to xray.
 				if m, ok := v.(map[string]interface{}); ok && len(m) > 0 {
-					sanitizeEmptyArrays(m)
-					xhttpSettings["extra"] = m
+					xhttpSettings["extra"] = sanitizeEmptyArrays(m)
 				}
 			}
 		}
@@ -850,20 +849,41 @@ func copyStrings(src []string) []string {
 	return out
 }
 
-// sanitizeEmptyArrays recursively removes empty slices from a map.
+// sanitizeEmptyArrays returns a copy with empty slices removed from maps.
 // PHP encodes empty objects as [] instead of {}; xray-core rejects []
 // for fields that expect struct types (e.g. sockopt, tlsSettings).
-func sanitizeEmptyArrays(m map[string]interface{}) {
+// The panel snapshot must stay unchanged for hashing and future reloads.
+func sanitizeEmptyArrays(m map[string]interface{}) map[string]interface{} {
+	out := make(map[string]interface{}, len(m))
 	for k, v := range m {
 		switch val := v.(type) {
 		case []interface{}:
 			if len(val) == 0 {
-				delete(m, k)
+				continue
 			}
+			out[k] = sanitizeArrayObjects(val)
 		case map[string]interface{}:
-			sanitizeEmptyArrays(val)
+			out[k] = sanitizeEmptyArrays(val)
+		default:
+			out[k] = v
 		}
 	}
+	return out
+}
+
+func sanitizeArrayObjects(values []interface{}) []interface{} {
+	out := make([]interface{}, len(values))
+	for i, value := range values {
+		switch value := value.(type) {
+		case map[string]interface{}:
+			out[i] = sanitizeEmptyArrays(value)
+		case []interface{}:
+			out[i] = sanitizeArrayObjects(value)
+		default:
+			out[i] = value
+		}
+	}
+	return out
 }
 
 // extractECHServerKeys extracts the ECH private key from tls_settings.ech

@@ -6,8 +6,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -15,8 +17,60 @@ import (
 	"github.com/kirakirai8023/Xboard-Node/internal/config"
 	"github.com/sagernet/sing-box/adapter"
 	singM "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 	"golang.org/x/time/rate"
 )
+
+type testPacketConn struct {
+	N.PacketConn
+	closed atomic.Bool
+}
+
+func (c *testPacketConn) Close() error { c.closed.Store(true); return nil }
+
+func TestDeviceLimit_TCPAndUDPShareSlots(t *testing.T) {
+	tracker := NewConnTracker(0)
+	tracker.SetUserMap(map[string]int{"u": 1})
+	tracker.SetDeviceLimitFunc(func(string) (int, bool) { return 1, true })
+	first := tracker.RoutedConnection(context.Background(), &testConn{}, testInboundContext("u", "9.9.9.9"), nil, nil)
+	second := &testPacketConn{}
+	tracker.RoutedPacketConnection(context.Background(), second, testInboundContext("u", "1.1.1.1"), nil, nil)
+	if !second.closed.Load() {
+		t.Fatal("lower-sorted UDP IP exceeded the TCP device limit")
+	}
+	sameIP := tracker.RoutedPacketConnection(context.Background(), &testPacketConn{}, testInboundContext("u", "9.9.9.9"), nil, nil)
+	_ = first.Close()
+	_, alive, count := tracker.GetUserTraffic()
+	if count != 1 || !alive[1]["9.9.9.9"] {
+		t.Fatalf("UDP did not retain its shared slot: %v, %d", alive, count)
+	}
+	_ = sameIP.Close()
+	_, alive, count = tracker.GetUserTraffic()
+	if count != 0 || len(alive) != 0 {
+		t.Fatalf("UDP did not release device slot: %v, %d", alive, count)
+	}
+}
+
+func TestDeviceLimit_ConcurrentAdmission(t *testing.T) {
+	tracker := NewConnTracker(0)
+	tracker.SetUserMap(map[string]int{"u": 1})
+	tracker.SetDeviceLimitFunc(func(string) (int, bool) { return 1, true })
+	var wg sync.WaitGroup
+	var accepted atomic.Int32
+	for i := 1; i <= 64; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if tracker.admitConnection("u", tracker.users[1], 1, fmt.Sprintf("192.0.2.%d", i)) {
+				accepted.Add(1)
+			}
+		}(i)
+	}
+	wg.Wait()
+	if accepted.Load() != 1 {
+		t.Fatalf("accepted=%d distinct IPs for one slot", accepted.Load())
+	}
+}
 
 func TestConnTracker_LargeCountBatch(t *testing.T) {
 	tracker := NewConnTracker(0)
@@ -209,11 +263,11 @@ func TestConnTrackerCheckDeviceGateMergesFreshGlobalDevices(t *testing.T) {
 	us.addConn("1.1.1.1")
 	tracker.UpdateGlobalDevices(map[int][]string{1: {"9.9.9.9"}})
 
-	if tracker.checkDeviceGate(us, 1, "2.2.2.2", 2) {
-		t.Fatal("expected lexicographically earlier candidate to remain allowed")
+	if !tracker.checkDeviceGate(us, 1, "2.2.2.2", 2) {
+		t.Fatal("merged local and global devices already fill both slots")
 	}
 	if !tracker.checkDeviceGate(us, 1, "99.99.99.99", 2) {
-		t.Fatal("expected merged local+global device state to reject lexicographically later third device")
+		t.Fatal("merged local and global devices must reject any third device")
 	}
 	if tracker.checkDeviceGate(us, 1, "1.1.1.1", 2) {
 		t.Fatal("existing local IP should still be allowed")

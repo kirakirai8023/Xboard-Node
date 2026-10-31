@@ -13,15 +13,18 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/kirakirai8023/Xboard-Node/internal/cert"
 	"github.com/kirakirai8023/Xboard-Node/internal/config"
 	"github.com/kirakirai8023/Xboard-Node/internal/kernel"
 	"github.com/kirakirai8023/Xboard-Node/internal/kernel/singbox"
@@ -183,6 +186,119 @@ func awaitTraffic(t *testing.T, node kernel.Kernel, ready func(map[int][2]int64)
 	}
 }
 
+func TestXray_PrivateDestinationsRequireExplicitOutboundPermission(t *testing.T) {
+	var hits atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		_, _ = w.Write([]byte("private-target"))
+	}))
+	defer target.Close()
+	_, targetPort, _ := net.SplitHostPort(target.Listener.Addr().String())
+	portNumber, _ := strconv.Atoi(targetPort)
+	for _, allow := range []bool{false, true} {
+		name := "default_block"
+		if allow {
+			name = "explicit_allow"
+		}
+		t.Run(name, func(t *testing.T) {
+			cfg := config.KernelConfig{Type: "xray", LogLevel: "error", ConfigDir: t.TempDir()}
+			if allow {
+				cfg.CustomOutbound = []map[string]any{{"tag": "direct", "protocol": "freedom",
+					"settings": map[string]any{"finalRules": []map[string]any{{
+						"action": "allow", "ip": []string{"127.0.0.1/32", "::1/128"}, "port": portNumber,
+					}}}}}
+			}
+			nodeKernel := xray.New(cfg)
+			node := &model.NodeSpec{Protocol: "vless", ListenIP: "127.0.0.1", ServerPort: unusedPort(t),
+				// Deliberately bypass router blocking: the freedom outbound must
+				// enforce its own final rules for IP and domain destinations.
+				CustomRouteRules: []model.CustomRouteRule{
+					{Match: model.RouteMatch{IPCIDRs: []string{"127.0.0.0/8", "::1/128"}}, Action: model.RouteAction{Type: "direct"}},
+					{Match: model.RouteMatch{Domains: []string{"localhost"}}, Action: model.RouteAction{Type: "direct"}},
+				}}
+			users := []model.UserSpec{{ID: 1, UUID: "11111111-1111-1111-1111-111111111111"}}
+			if err := nodeKernel.Start(node, users, kernel.TLSCert{}); err != nil {
+				t.Fatal(err)
+			}
+			defer nodeKernel.Stop()
+			address := net.JoinHostPort("127.0.0.1", strconv.Itoa(node.ServerPort))
+			for _, host := range []string{"127.0.0.1", "localhost"} {
+				before := hits.Load()
+				conn := dialNode(t, "vless", address, net.JoinHostPort(host, targetPort), users[0].UUID)
+				_ = conn.SetDeadline(time.Now().Add(time.Second))
+				_, _ = io.WriteString(conn, "GET / HTTP/1.0\r\nHost: localhost\r\n\r\n")
+				response, err := io.ReadAll(conn)
+				conn.Close()
+				if allow {
+					if err != nil || !bytes.Contains(response, []byte("private-target")) || hits.Load() != before+1 {
+						t.Fatalf("explicit permission failed for %s: response=%q, error=%v", host, response, err)
+					}
+				} else if len(response) != 0 || hits.Load() != before {
+					t.Fatalf("private destination reached through %s", host)
+				}
+			}
+		})
+	}
+}
+
+func TestKernel_TLSCertificateReloadSamePort(t *testing.T) {
+	material := func() kernel.TLSCert {
+		mgr := cert.NewManager(config.CertConfig{CertMode: "self", CertDir: t.TempDir(), Domain: "localhost"})
+		if err := mgr.Start(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		return mgr.TLSCert()
+	}
+	first, renewed := material(), material()
+	for _, backend := range []string{"singbox", "xray"} {
+		t.Run(backend, func(t *testing.T) {
+			cfg := config.KernelConfig{Type: backend, LogLevel: "error", ConfigDir: t.TempDir()}
+			var nodeKernel kernel.Kernel
+			if backend == "singbox" {
+				nodeKernel = singbox.New(cfg)
+			} else {
+				nodeKernel = xray.New(cfg)
+			}
+			node := &model.NodeSpec{Protocol: "vless", ListenIP: "127.0.0.1", ServerPort: unusedPort(t), TLS: 1}
+			users := []model.UserSpec{{ID: 1, UUID: "11111111-1111-1111-1111-111111111111"}}
+			if err := nodeKernel.Start(node, users, first); err != nil {
+				t.Fatal(err)
+			}
+			defer nodeKernel.Stop()
+			assertCertificate := func(want kernel.TLSCert) {
+				t.Helper()
+				conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 2 * time.Second}, "tcp",
+					net.JoinHostPort("127.0.0.1", strconv.Itoa(node.ServerPort)), &tls.Config{InsecureSkipVerify: true})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer conn.Close()
+				block, _ := pem.Decode(want.CertPEM)
+				if block == nil || !bytes.Equal(conn.ConnectionState().PeerCertificates[0].Raw, block.Bytes) {
+					t.Fatal("listener is serving outdated certificate material")
+				}
+			}
+			assertCertificate(first)
+			if err := nodeKernel.Reload(node, users, renewed); err != nil {
+				t.Fatalf("renew certificate on occupied port: %v", err)
+			}
+			assertCertificate(renewed)
+			if err := nodeKernel.Reload(node, users, kernel.TLSCert{CertPEM: []byte("invalid"), KeyPEM: []byte("invalid")}); err == nil {
+				t.Fatal("invalid renewal unexpectedly succeeded")
+			}
+			assertCertificate(renewed) // A failed renewal must restore the last working certificate.
+			if backend == "xray" {
+				invalidNode := *node
+				invalidNode.Network = "invalid-transport"
+				if err := nodeKernel.Reload(&invalidNode, users, renewed); err == nil {
+					t.Fatal("invalid replacement unexpectedly succeeded")
+				}
+				assertCertificate(renewed) // Also exercise rollback after releasing the old listener.
+			}
+		})
+	}
+}
+
 // Use a local TLS 1.3 target both for REALITY camouflage and HTTPS payloads.
 // No public DNS, external servers, production credentials or fixed ports.
 func TestXray_RealityVisionUnlimited(t *testing.T) {
@@ -288,9 +404,20 @@ func dialNodeWithCredential(protocol, address, target, credential string) (net.C
 	host, portString, _ := net.SplitHostPort(target)
 	port, _ := strconv.Atoi(portString)
 	header := append([]byte{0}, id...)
-	// VLESS v0: no addons, TCP command, destination port, IPv4 address.
-	header = append(header, 0, 1, byte(port>>8), byte(port), 1)
-	header = append(header, net.ParseIP(host).To4()...)
+	// VLESS v0: no addons, TCP command, destination port, typed address.
+	header = append(header, 0, 1, byte(port>>8), byte(port))
+	if ip := net.ParseIP(host); ip != nil {
+		if ipv4 := ip.To4(); ipv4 != nil {
+			header = append(header, 1)
+			header = append(header, ipv4...)
+		} else {
+			header = append(header, 3)
+			header = append(header, ip.To16()...)
+		}
+	} else {
+		header = append(header, 2, byte(len(host)))
+		header = append(header, host...)
+	}
 	if _, err := conn.Write(header); err != nil {
 		conn.Close()
 		return nil, err

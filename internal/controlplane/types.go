@@ -74,6 +74,18 @@ type Source interface {
 	SupportsDiscovery() bool
 }
 
+// SnapshotInvalidator requests an unconditional snapshot on the next poll.
+// Implementations must allow invalidation while a poll is in flight.
+type SnapshotInvalidator interface {
+	InvalidateSnapshot()
+}
+
+// ReconciliationRequester retains event loss when the notification queue is
+// full. The service consumes requests on its event loop and retries polling.
+type ReconciliationRequester interface {
+	ConsumeResyncRequest() bool
+}
+
 type Sink interface {
 	Report(payload ReportPayload) error
 	ReportDevices(push PushClient, devices map[int][]string)

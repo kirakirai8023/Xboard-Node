@@ -4,7 +4,9 @@ package xray
 
 import (
 	"context"
+	"fmt"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -17,6 +19,69 @@ import (
 	"github.com/xtls/xray-core/transport"
 	"golang.org/x/time/rate"
 )
+
+func TestDeviceLimit_TCPAndUDPShareSlots(t *testing.T) {
+	for _, firstTCP := range []bool{false, true} {
+		t.Run(fmt.Sprint("tcp=", firstTCP), func(t *testing.T) {
+			d := newTestDispatcher()
+			d.UpdateLimits(map[string]int{"user@1": 1}, map[string]int{"user@1": 1}, nil)
+			if d.checkDeviceLimit("user@1", "9.9.9.9", firstTCP) {
+				t.Fatal("first device rejected")
+			}
+			if !d.checkDeviceLimit("user@1", "1.1.1.1", !firstTCP) {
+				t.Fatal("lower-sorted device exceeded limit")
+			}
+			link := &transport.Link{Reader: nopReader{}, Writer: buf.Discard}
+			d.trackLink(link, "user@1", "9.9.9.9", firstTCP)
+			if err := link.Writer.(*closeTrackingWriter).Close(); err != nil {
+				t.Fatal(err)
+			}
+			if d.checkDeviceLimit("user@1", "1.1.1.1", !firstTCP) {
+				t.Fatal("closed session did not release its slot")
+			}
+		})
+	}
+}
+
+func TestDeviceLimit_ConcurrentAdmission(t *testing.T) {
+	d := newTestDispatcher()
+	d.UpdateLimits(map[string]int{"user@1": 1}, map[string]int{"user@1": 1}, nil)
+	var wg sync.WaitGroup
+	var accepted atomic.Int32
+	for i := 1; i <= 64; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if !d.checkDeviceLimit("user@1", fmt.Sprintf("192.0.2.%d", i), i%2 == 0) {
+				accepted.Add(1)
+			}
+		}(i)
+	}
+	wg.Wait()
+	if accepted.Load() != 1 {
+		t.Fatalf("accepted=%d distinct IPs for one slot", accepted.Load())
+	}
+}
+
+func TestDeviceLimit_PolicyTransitionsPreserveOccupancy(t *testing.T) {
+	d := newTestDispatcher()
+	d.UpdateLimits(map[string]int{"user@1": 1}, nil, nil)
+	d.checkDeviceLimit("user@1", "9.9.9.9", true)
+	d.UpdateLimits(map[string]int{"user@1": 1}, map[string]int{"user@1": 1}, nil)
+	if !d.checkDeviceLimit("user@1", "1.1.1.1", false) {
+		t.Fatal("enabling a limit ignored existing unlimited sessions")
+	}
+	d.delConn("user@1", "9.9.9.9")
+	if d.checkDeviceLimit("user@1", "1.1.1.1", false) {
+		t.Fatal("old unlimited session did not release slot")
+	}
+	d.UpdateLimits(map[string]int{"user@1": 1}, nil, nil)
+	d.checkDeviceLimit("user@1", "2.2.2.2", true)
+	d.UpdateLimits(map[string]int{"user@1": 1}, map[string]int{"user@1": 2}, nil)
+	if !d.checkDeviceLimit("user@1", "3.3.3.3", true) {
+		t.Fatal("mixed limited and unlimited sessions exceeded limit")
+	}
+}
 
 type nativeDispatcher struct {
 	routing.Dispatcher

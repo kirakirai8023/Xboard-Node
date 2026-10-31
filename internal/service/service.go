@@ -3,6 +3,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -51,6 +52,7 @@ type Service struct {
 	appliedState struct {
 		Config *model.NodeSpec
 		Users  []model.UserSpec
+		TLS    kernel.TLSCert
 	}
 
 	pushInterval int // seconds
@@ -66,6 +68,12 @@ type Service struct {
 	pullActive atomic.Bool
 	// pullResults delivers async pullViaAPI results back to the main goroutine.
 	pullResults chan pullResult
+	pushWG      sync.WaitGroup
+	// Revisions are owned by the event loop. A REST response must not replace
+	// a newer push update, even when that update has the same content.
+	configRevision uint64
+	userRevision   uint64
+	resyncRevision uint64
 
 	wsClient         controlplane.PushClient        // Push client (nil if push is not enabled)
 	wsEvents         chan controlplane.Event        // receives data events from push transport
@@ -82,11 +90,14 @@ type Service struct {
 
 // pullResult carries the outcome of an async pullViaAPI back to the main goroutine.
 type pullResult struct {
-	config      *model.NodeSpec
-	users       []model.UserSpec
-	configHash  string
-	userHash    string
-	certChanged bool
+	config         *model.NodeSpec
+	users          []model.UserSpec
+	configHash     string
+	userHash       string
+	configRevision uint64
+	userRevision   uint64
+	resyncRevision uint64
+	err            error
 }
 
 // apiBackoff implements simple exponential backoff for API failures.
@@ -207,10 +218,15 @@ func (s *Service) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
+			s.kernel.Stop()
+			s.collectTraffic(context.Background())
+			s.pushWG.Wait()
 			s.pushReportSync()
 			return nil
 
 		case <-trackTicker.C:
+			s.checkReconciliation(ctx)
+			s.refreshCertificate(ctx)
 			s.trackAndEnforce(ctx)
 
 		case <-reportTicker.C:
@@ -220,12 +236,13 @@ func (s *Service) Run(ctx context.Context) error {
 			s.reportDevices()
 
 		case <-pullTicker.C:
-			// When WebSocket is connected, skip REST polling entirely.
-			// Config/user updates arrive via WS push.
-			if s.wsClient != nil && s.wsClient.IsConnected() {
+			s.checkReconciliation(ctx)
+			// Push replaces routine polling, but pending reconciliation must retry
+			// even while the WebSocket remains connected.
+			if s.wsClient != nil && s.wsClient.IsConnected() && !s.wsResyncPending.Load() {
 				continue
 			}
-			nlog.Core().Debug("polling from API (ws not connected)")
+			nlog.Core().Debug("polling from API")
 			s.pullViaAPIAsync(ctx)
 
 		case result := <-s.pullResults:
@@ -278,6 +295,8 @@ drain:
 		}
 		if event.Type == controlplane.EventSyncUserDelta && len(event.DeltaUsers) > 0 &&
 			event.DeltaAction == "add" && newUsersOnly(base, event.DeltaUsers) {
+			s.userRevision++
+			s.invalidateSnapshot()
 			if !pending {
 				users = append([]model.UserSpec{}, s.lastUsers...)
 			}
@@ -480,15 +499,27 @@ func (s *Service) drainMachineMailbox(ctx context.Context) {
 }
 
 func (s *Service) requestWSResync(ctx context.Context, reason string) {
-	if !s.wsResyncPending.CompareAndSwap(false, true) {
-		return
-	}
+	s.resyncRevision++
+	s.wsResyncPending.Store(true)
+	s.invalidateSnapshot()
 	if s.nodeLog != nil {
 		s.nodeLog.Warn("ws state may be stale, scheduling REST reconciliation", "reason", reason)
 	} else {
 		nlog.Core().Warn("ws state may be stale, scheduling REST reconciliation", "reason", reason)
 	}
 	s.pullViaAPIAsync(ctx)
+}
+
+func (s *Service) invalidateSnapshot() {
+	if source, ok := s.source.(controlplane.SnapshotInvalidator); ok {
+		source.InvalidateSnapshot()
+	}
+}
+
+func (s *Service) checkReconciliation(ctx context.Context) {
+	if source, ok := s.source.(controlplane.ReconciliationRequester); ok && source.ConsumeResyncRequest() {
+		s.requestWSResync(ctx, "notification_queue_full")
+	}
 }
 
 func (s *Service) wsMetrics() map[string]interface{} {
@@ -503,10 +534,9 @@ func (s *Service) wsMetrics() map[string]interface{} {
 // - On disconnect: record timestamp, immediately REST poll.
 // - On reconnect: clear disconnect timestamp, REST poll to catch missed events.
 func (s *Service) handleWSStatus(ctx context.Context, status controlplane.StatusChange) {
-	if status.NeedsResync {
-		s.requestWSResync(ctx, "drop_detected")
-	}
+	reason := "disconnected"
 	if status.Connected {
+		reason = "connected"
 		s.metricsMu.Lock()
 		s.wsDisconnectAt = time.Time{}
 		s.metricsMu.Unlock()
@@ -518,7 +548,6 @@ func (s *Service) handleWSStatus(ctx context.Context, status controlplane.Status
 		}
 		// After reconnect, proactively pull once to ensure we haven't missed
 		// any updates during the disconnection window.
-		s.pullViaAPIAsync(ctx)
 	} else {
 		s.metricsMu.Lock()
 		if s.wsDisconnectAt.IsZero() {
@@ -532,8 +561,11 @@ func (s *Service) handleWSStatus(ctx context.Context, status controlplane.Status
 		}
 		// Clear global device state on disconnect
 		s.kernel.ClearGlobalDevices()
-		s.pullViaAPIAsync(ctx)
 	}
+	if status.NeedsResync {
+		reason = "drop_detected"
+	}
+	s.requestWSResync(ctx, reason)
 }
 
 // wsDiscovery periodically checks WS availability:
@@ -600,6 +632,8 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 		if event.Config == nil {
 			return
 		}
+		s.configRevision++
+		s.invalidateSnapshot()
 		newConfigHash := computeConfigHash(event.Config)
 		if newConfigHash == s.lastConfigHash {
 			return
@@ -624,6 +658,8 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 		if event.Users == nil {
 			return
 		}
+		s.userRevision++
+		s.invalidateSnapshot()
 		newHash := computeUserHash(event.Users)
 		if newHash == s.lastUserHash {
 			return
@@ -637,6 +673,8 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 		if len(event.DeltaUsers) == 0 {
 			return
 		}
+		s.userRevision++
+		s.invalidateSnapshot()
 		if s.nodeLog != nil {
 			s.nodeLog.Info(fmt.Sprintf("users delta: %s, %d users", event.DeltaAction, len(event.DeltaUsers)))
 		}
@@ -669,26 +707,14 @@ func (s *Service) pullViaAPIAsync(ctx context.Context) {
 		return
 	}
 
-	currentConfigHash := s.lastConfigHash
-	certChanged := s.cert.CertRenewed()
+	result := pullResult{configRevision: s.configRevision, userRevision: s.userRevision, resyncRevision: s.resyncRevision}
 
 	go func() {
-		defer s.pullActive.Store(false)
 		snapshot, err := s.source.Poll(ctx)
-		if err != nil {
-			nlog.Core().Error("poll control plane failed", "error", err)
-			s.pullBackoff.onFailure()
-			return
-		}
-		s.pullBackoff.onSuccess()
-
-		result := pullResult{certChanged: certChanged}
+		result.err = err
 		if snapshot.Config != nil {
 			result.config = snapshot.Config
 			result.configHash = computeConfigHash(snapshot.Config)
-			if result.configHash == currentConfigHash && !certChanged {
-				result.config = nil
-			}
 		}
 		if snapshot.Users != nil {
 			result.users = snapshot.Users
@@ -698,21 +724,43 @@ func (s *Service) pullViaAPIAsync(ctx context.Context) {
 		select {
 		case s.pullResults <- result:
 		case <-ctx.Done():
+			s.pullActive.Store(false)
 		}
 	}()
 }
 
 // applyPullResult processes the result of an async pullViaAPI on the main goroutine.
 func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
-	s.wsResyncPending.Store(false)
+	s.checkReconciliation(ctx)
+	s.pullActive.Store(false)
+	if result.err != nil {
+		nlog.Core().Error("poll control plane failed", "error", result.err)
+		s.pullBackoff.onFailure()
+		s.wsResyncPending.Store(true)
+		return
+	}
+	s.pullBackoff.onSuccess()
+	if result.resyncRevision != s.resyncRevision {
+		// An event was lost after this request began. Its response cannot
+		// establish the current authorization state, even without a push.
+		s.invalidateSnapshot()
+		s.wsResyncPending.Store(true)
+		return
+	}
+	stale := result.configRevision != s.configRevision || result.userRevision != s.userRevision
+	if result.configRevision != s.configRevision {
+		result.config = nil
+	}
+	if result.userRevision != s.userRevision {
+		result.users = nil
+	}
+	if stale {
+		s.invalidateSnapshot()
+	}
+	s.wsResyncPending.Store(stale)
 	configChanged := false
 
-	if result.certChanged {
-		nlog.Core().Info("certificate renewed, kernel restart needed")
-		configChanged = true
-	}
-
-	if result.config != nil {
+	if result.config != nil && result.configHash != s.lastConfigHash {
 		if err := validateNodeRuntime(s.cfg, s.kernel.Protocols(), result.config, s.cert.TLSCert()); err != nil {
 			nlog.Core().Warn("runtime config validation failed", "error", err)
 			result.config = nil
@@ -792,13 +840,15 @@ func (s *Service) restoreUserState(users []model.UserSpec, hash string) {
 // startKernel starts (or restarts) the kernel with the given config/users and
 // records the successfully applied state. Returns false on error.
 func (s *Service) startKernel(nc *model.NodeSpec, users []model.UserSpec) bool {
-	if err := s.kernel.Start(nc, users, s.cert.TLSCert()); err != nil {
+	tls := s.cert.TLSCert()
+	if err := s.kernel.Start(nc, users, tls); err != nil {
 		nlog.Core().Error("failed to start kernel", "error", err)
 		return false
 	}
 
 	s.appliedState.Config = nc
 	s.appliedState.Users = users
+	s.appliedState.TLS = tls
 
 	// Initialize node logger on first successful start
 	if s.nodeLog == nil {
@@ -822,6 +872,7 @@ func (s *Service) applyUserUpdate(ctx context.Context, users []model.UserSpec, n
 	// Stop listeners centrally rather than relying on protocol-specific behavior.
 	if len(users) == 0 {
 		s.kernel.Stop()
+		s.collectTraffic(ctx)
 		s.appliedState.Users = nil
 		return
 	}
@@ -975,6 +1026,7 @@ func (s *Service) applyChanges(ctx context.Context, configChanged, usersChanged 
 	if s.lastConfig == nil || len(s.lastUsers) == 0 {
 		if len(s.lastUsers) == 0 {
 			s.kernel.Stop()
+			s.collectTraffic(ctx)
 			s.appliedState.Users = nil
 		}
 		return
@@ -983,12 +1035,14 @@ func (s *Service) applyChanges(ctx context.Context, configChanged, usersChanged 
 	// If config changed, delegate to kernel.Reload. The kernel implementation
 	// decides whether to hot-swap users, reconstruct inbounds, or restart itself.
 	if configChanged && s.kernel.IsRunning() {
-		if err := s.kernel.Reload(s.lastConfig, s.lastUsers, s.cert.TLSCert()); err != nil {
+		tls := s.cert.TLSCert()
+		if err := s.kernel.Reload(s.lastConfig, s.lastUsers, tls); err != nil {
 			nlog.Core().Warn(fmt.Sprintf("reload failed, restarting: %v", err))
 			s.startKernel(s.lastConfig, s.lastUsers)
 		} else {
 			s.appliedState.Config = s.lastConfig
 			s.appliedState.Users = s.lastUsers
+			s.appliedState.TLS = tls
 			if s.nodeLog != nil {
 				s.nodeLog.Info(fmt.Sprintf("config updated, %d users", len(s.lastUsers)))
 			}
@@ -1002,7 +1056,20 @@ func (s *Service) trackAndEnforce(ctx context.Context) {
 	if !s.kernel.IsRunning() {
 		return
 	}
+	s.collectTraffic(ctx)
+}
 
+// Certificate delivery is independent of panel connectivity and HTTP success.
+// Comparing applied material also retries a failed reload on the next tick.
+func (s *Service) refreshCertificate(ctx context.Context) {
+	current := s.cert.TLSCert()
+	if s.kernel.IsRunning() && (!bytes.Equal(current.CertPEM, s.appliedState.TLS.CertPEM) ||
+		!bytes.Equal(current.KeyPEM, s.appliedState.TLS.KeyPEM)) {
+		s.applyChanges(ctx, true, false)
+	}
+}
+
+func (s *Service) collectTraffic(ctx context.Context) {
 	traffic, aliveIPs, connCount, err := s.kernel.GetUserTraffic(ctx)
 	if err != nil {
 		nlog.Core().Debug("get user traffic failed", "error", err)
@@ -1044,7 +1111,9 @@ func (s *Service) pushReportAsync() {
 	metrics := s.buildMetrics(status)
 	metrics["kernel_status"] = s.kernel.IsRunning()
 
+	s.pushWG.Add(1)
 	go func() {
+		defer s.pushWG.Done()
 		defer s.pushActive.Store(false)
 		if err := s.sink.Report(controlplane.ReportPayload{Traffic: traffic, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
 			nlog.Core().Warn("failed to push report", "error", err)

@@ -3,6 +3,7 @@
 package xray
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
@@ -14,7 +15,43 @@ import (
 	"github.com/kirakirai8023/Xboard-Node/internal/kernel"
 	"github.com/kirakirai8023/Xboard-Node/internal/model"
 	"github.com/kirakirai8023/Xboard-Node/internal/panel"
+	"github.com/xtls/xray-core/infra/conf/serial"
 )
+
+func TestBuildConfig_XHTTPPreservesSourceAndHash(t *testing.T) {
+	for _, network := range []string{"xhttp", "splithttp"} {
+		t.Run(network, func(t *testing.T) {
+			node := &model.NodeSpec{
+				Protocol: "vless", ListenIP: "127.0.0.1", ServerPort: 12345, Network: network,
+				NetworkSettings: M{"path": "/transport", "mode": "auto", "extra": M{
+					"headers": []any{}, "xmux": []any{},
+					"downloadSettings": M{"network": "xhttp", "sockopt": []any{}, "xhttpSettings": M{"path": "/download"}},
+				}},
+			}
+			before, err := json.Marshal(node)
+			if err != nil {
+				t.Fatal(err)
+			}
+			hash := kernel.ComputeHash(node, testUsers)
+			generated := buildConfig(testKernelCfg, node, testUsers, kernel.TLSCert{})
+			after, _ := json.Marshal(node)
+			if !bytes.Equal(before, after) || kernel.ComputeHash(node, testUsers) != hash {
+				t.Fatal("building XHTTP settings modified the source node and its reload hash")
+			}
+			data, err := json.Marshal(generated)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := serial.LoadJSONConfig(bytes.NewReader(data)); err != nil {
+				t.Fatalf("normalized XHTTP configuration was rejected by Xray: %v", err)
+			}
+			second, _ := json.Marshal(buildConfig(testKernelCfg, node, testUsers, kernel.TLSCert{}))
+			if !bytes.Equal(data, second) {
+				t.Fatal("identical XHTTP settings produced different configurations")
+			}
+		})
+	}
+}
 
 func TestBuildConfig_CustomPolicyPreservesAccounting(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "custom.json")

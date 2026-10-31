@@ -4,6 +4,25 @@ import (
 	"testing"
 )
 
+func TestAliveReports_RetryUsesCurrentSnapshot(t *testing.T) {
+	tr := New()
+	tr.Process(nil, map[int]map[string]bool{1: {"1.1.1.1": true}}, 1)
+	first := tr.FlushAliveIPs()
+	tr.RestoreAliveIPs(first)
+	if retry := tr.FlushAliveIPs(); len(retry[1]) != 1 {
+		t.Fatalf("unchanged failed report was skipped: %v", retry)
+	}
+	tr.Process(nil, map[int]map[string]bool{1: {"2.2.2.2": true}}, 1)
+	tr.RestoreAliveIPs(first)
+	current := tr.FlushAliveIPs()
+	if len(current[1]) != 1 || current[1][0] != "2.2.2.2" {
+		t.Fatalf("retry resurrected disconnected IPs: %v", current)
+	}
+	if len(first[1]) != 1 || first[1][0] != "1.1.1.1" {
+		t.Fatal("later flush mutated an in-flight payload")
+	}
+}
+
 func TestProcess_InitialTraffic(t *testing.T) {
 	tr := New()
 	cumTraffic := map[int][2]int64{

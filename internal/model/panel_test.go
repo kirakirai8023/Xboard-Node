@@ -8,6 +8,26 @@ import (
 	"github.com/kirakirai8023/Xboard-Node/internal/panel"
 )
 
+func TestNodeSpecFromPanelValidated_XHTTPFlow(t *testing.T) {
+	for _, network := range []string{"xhttp", "splithttp"} {
+		t.Run(network, func(t *testing.T) {
+			for _, tls := range []int{0, 1, 2} {
+				node := &panel.NodeConfig{Protocol: "vless", ServerPort: 443, Network: network, TLS: tls, Flow: "xtls-rprx-vision"}
+				if _, err := NodeSpecFromPanelValidated(node, config.KernelConfig{Type: "xray"}); err == nil || !strings.Contains(err.Error(), "clear flow") {
+					t.Fatalf("XHTTP accepted Vision or returned no actionable error: %v", err)
+				}
+				node.Flow = ""
+				if _, err := NodeSpecFromPanelValidated(node, config.KernelConfig{Type: "xray"}); err != nil {
+					t.Fatalf("XHTTP without flow: %v", err)
+				}
+			}
+		})
+	}
+	if _, err := NodeSpecFromPanelValidated(&panel.NodeConfig{Protocol: "vless", ServerPort: 443, Network: "tcp", TLS: 2, Flow: "xtls-rprx-vision"}, config.KernelConfig{Type: "xray"}); err != nil {
+		t.Fatalf("direct Reality/Vision was rejected: %v", err)
+	}
+}
+
 func TestNodeSpecFromPanelValidated(t *testing.T) {
 	t.Run("valid custom outbounds and route targets", func(t *testing.T) {
 		node, err := NodeSpecFromPanelValidated(&panel.NodeConfig{

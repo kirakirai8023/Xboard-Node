@@ -3,6 +3,7 @@ package controlplane
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/kirakirai8023/Xboard-Node/internal/config"
@@ -12,10 +13,12 @@ import (
 )
 
 type PanelControlPlane struct {
-	cfg    config.PanelConfig
-	wsCfg  config.WSConfig
-	kcfg   config.KernelConfig
-	client *panel.Client
+	cfg          config.PanelConfig
+	wsCfg        config.WSConfig
+	kcfg         config.KernelConfig
+	client       *panel.Client
+	fullSnapshot atomic.Bool
+	resyncNeeded atomic.Bool
 }
 
 type panelPushClient struct {
@@ -68,7 +71,28 @@ func (p *PanelControlPlane) Initial(ctx context.Context, metricsFn func() map[st
 	return bootstrap, nil
 }
 
-func (p *PanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
+func (p *PanelControlPlane) InvalidateSnapshot() { p.fullSnapshot.Store(true) }
+
+func (p *PanelControlPlane) ConsumeResyncRequest() bool { return p.resyncNeeded.Swap(false) }
+
+func (p *PanelControlPlane) notifyResync(statuses chan<- StatusChange) {
+	select {
+	case statuses <- StatusChange{Connected: true, NeedsResync: true}:
+	default:
+		p.resyncNeeded.Store(true)
+	}
+}
+
+func (p *PanelControlPlane) Poll(ctx context.Context) (snapshot Snapshot, pollErr error) {
+	if p.fullSnapshot.Swap(false) {
+		p.client.ResetETags()
+	}
+	defer func() {
+		if pollErr != nil {
+			// Neither ETag is committed if only part of a snapshot succeeds.
+			p.client.ResetETags()
+		}
+	}()
 	configSnapshot, err := p.client.GetConfig()
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("poll config: %w", err)
@@ -142,10 +166,7 @@ func (p *PanelControlPlane) newPushClient(metricsFn func() map[string]interface{
 			case events <- translated:
 			default:
 				nlog.Core().Warn("ws event channel full, dropping event", "type", translated.Type)
-				select {
-				case statuses <- StatusChange{Connected: true, NeedsResync: true}:
-				default:
-				}
+				p.notifyResync(statuses)
 			}
 		},
 		func(status panel.WSStatusChange) {

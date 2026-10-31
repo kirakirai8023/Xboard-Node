@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -263,21 +262,9 @@ func (t *ConnTracker) RoutedConnection(
 	us := t.users[uid]
 	t.usersMu.RUnlock()
 
-	// Device limit gate-keeping
-	if dlf := t.deviceLimitFunc.Load(); dlf != nil {
-		if limit, hasLimit := (*dlf)(uuid); hasLimit {
-			if t.checkDeviceGate(us, uid, sourceIP, limit) {
-				nlog.Core().Info("singbox: device limit gate-keep, rejecting connection",
-					"user", uuid, "ip", sourceIP, "limit", limit)
-				conn.Close()
-				return conn
-			}
-		}
-	}
-
-	// Register connection
-	if us != nil {
-		us.addConn(sourceIP)
+	if !t.admitConnection(uuid, us, uid, sourceIP) {
+		_ = conn.Close()
+		return conn
 	}
 
 	connID := t.nextID()
@@ -318,20 +305,9 @@ func (t *ConnTracker) RoutedPacketConnection(
 	us := t.users[uid]
 	t.usersMu.RUnlock()
 
-	// Device limit gate-keeping
-	if dlf := t.deviceLimitFunc.Load(); dlf != nil {
-		if limit, hasLimit := (*dlf)(uuid); hasLimit {
-			if t.checkDeviceGate(us, uid, sourceIP, limit) {
-				nlog.Core().Info("singbox: device limit gate-keep, rejecting UDP connection",
-					"user", uuid, "ip", sourceIP, "limit", limit)
-				conn.Close()
-				return conn
-			}
-		}
-	}
-
-	if us != nil {
-		us.addConn(sourceIP)
+	if !t.admitConnection(uuid, us, uid, sourceIP) {
+		_ = conn.Close()
+		return conn
 	}
 
 	connID := t.nextID()
@@ -357,87 +333,58 @@ func (t *ConnTracker) RoutedPacketConnection(
 	return tracked
 }
 
-// checkDeviceGate rejects connections exceeding device limit.
-// Strategy: merge local + global state when fresh; local-only when stale.
-func (t *ConnTracker) checkDeviceGate(us *userStats, userID int, sourceIP string, limit int) bool {
-	if us == nil || limit <= 0 {
-		return false
-	}
-
-	us.mu.RLock()
-	localIPs := make(map[string]bool, len(us.ips))
-	for ip := range us.ips {
-		localIPs[ip] = true
-	}
-	localCount := len(us.ips)
-	us.mu.RUnlock()
-
-	// Already known locally
-	if localIPs[sourceIP] {
-		return false
-	}
-
-	// Check global state freshness
-	t.globalMu.RLock()
-	globalStale := time.Since(t.globalLastUpdate) > 60*time.Second
-	globalIPs := t.globalDevices[userID]
-	t.globalMu.RUnlock()
-
-	// Stale or missing global state → local-only check
-	if globalStale || globalIPs == nil {
-		if localCount < limit {
-			return false
-		}
-		ipList := make([]string, 0, localCount+1)
-		for ip := range localIPs {
-			ipList = append(ipList, ip)
-		}
-		ipList = append(ipList, sourceIP)
-		sort.Strings(ipList)
-		for i := 0; i < limit && i < len(ipList); i++ {
-			if ipList[i] == sourceIP {
-				return false
-			}
-		}
-		nlog.Core().Debug("device limit: local over limit, rejecting",
-			"userID", userID, "ip", sourceIP, "localIPs", localCount, "limit", limit)
+// admitConnection checks and reserves a device slot under the same user lock.
+// TCP and UDP share the same source-IP refcounts.
+func (t *ConnTracker) admitConnection(uuid string, us *userStats, uid int, sourceIP string) bool {
+	if us == nil {
 		return true
 	}
-
-	// Known globally (from other node)
-	if globalIPs[sourceIP] {
-		return false
-	}
-
-	// Merge local + global
-	allIPs := make(map[string]bool)
-	for ip := range localIPs {
-		allIPs[ip] = true
-	}
-	for ip := range globalIPs {
-		allIPs[ip] = true
-	}
-
-	if len(allIPs) < limit {
-		return false
-	}
-
-	// Over limit → lexicographic selection
-	ipList := make([]string, 0, len(allIPs)+1)
-	for ip := range allIPs {
-		ipList = append(ipList, ip)
-	}
-	ipList = append(ipList, sourceIP)
-	sort.Strings(ipList)
-
-	for i := 0; i < limit && i < len(ipList); i++ {
-		if ipList[i] == sourceIP {
-			return false
+	limit := 0
+	if fn := t.deviceLimitFunc.Load(); fn != nil {
+		if value, enabled := (*fn)(uuid); enabled {
+			limit = value
 		}
 	}
-	nlog.Core().Debug("device limit: total over limit, rejecting",
-		"userID", userID, "ip", sourceIP, "totalIPs", len(allIPs), "limit", limit)
+	us.mu.Lock()
+	defer us.mu.Unlock()
+	if t.deviceLimitExceededLocked(us, uid, sourceIP, limit) {
+		return false
+	}
+	us.connCount++
+	us.ips[sourceIP]++
 	return true
+}
+
+// checkDeviceGate probes admission without reserving a slot.
+func (t *ConnTracker) checkDeviceGate(us *userStats, userID int, sourceIP string, limit int) bool {
+	if us == nil {
+		return false
+	}
+	us.mu.RLock()
+	defer us.mu.RUnlock()
+	return t.deviceLimitExceededLocked(us, userID, sourceIP, limit)
+}
+
+func (t *ConnTracker) deviceLimitExceededLocked(us *userStats, userID int, sourceIP string, limit int) bool {
+	if limit <= 0 || us.ips[sourceIP] > 0 {
+		return false
+	}
+	t.globalMu.RLock()
+	defer t.globalMu.RUnlock()
+	global := t.globalDevices[userID]
+	if time.Since(t.globalLastUpdate) > 60*time.Second {
+		global = nil
+	}
+	if global[sourceIP] {
+		return false
+	}
+	count := len(us.ips)
+	for ip := range global {
+		if us.ips[ip] == 0 {
+			count++
+		}
+	}
+	return count >= limit
 }
 
 func (t *ConnTracker) nextID() string {

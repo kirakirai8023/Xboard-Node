@@ -39,6 +39,10 @@ func ValidateNodeSpec(n *NodeSpec, kcfg config.KernelConfig) error {
 	if err := validateTransportKernel(n.Network, kernelType); err != nil {
 		return err
 	}
+	transport := strings.ToLower(strings.TrimSpace(n.Network))
+	if strings.EqualFold(n.Protocol, "vless") && n.Flow != "" && (transport == "xhttp" || transport == "splithttp") {
+		return fmt.Errorf("VLESS flow is not supported with XHTTP; clear flow in the panel and client (Vision requires a direct TLS/REALITY transport)")
+	}
 	return nil
 }
 

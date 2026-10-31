@@ -3,6 +3,7 @@ package controlplane
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/kirakirai8023/Xboard-Node/internal/config"
 	"github.com/kirakirai8023/Xboard-Node/internal/model"
@@ -15,9 +16,10 @@ import (
 // with machine-level auth; WS events are delivered via an externally-managed
 // PushClient supplied by the machine WS mux.
 type MachinePanelControlPlane struct {
-	client *panel.Client
-	kcfg   config.KernelConfig
-	push   PushClient // virtual push client from WS mux (may be nil)
+	client       *panel.Client
+	kcfg         config.KernelConfig
+	push         PushClient // virtual push client from WS mux (may be nil)
+	fullSnapshot atomic.Bool
 
 	registerFn func(statuses chan<- StatusChange) *NodeMailbox
 }
@@ -95,7 +97,17 @@ func (p *MachinePanelControlPlane) Initial(
 	return bootstrap, nil
 }
 
-func (p *MachinePanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
+func (p *MachinePanelControlPlane) InvalidateSnapshot() { p.fullSnapshot.Store(true) }
+
+func (p *MachinePanelControlPlane) Poll(ctx context.Context) (snapshot Snapshot, pollErr error) {
+	if p.fullSnapshot.Swap(false) {
+		p.client.ResetETags()
+	}
+	defer func() {
+		if pollErr != nil {
+			p.client.ResetETags()
+		}
+	}()
 	configSnapshot, err := p.client.GetConfig()
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("machine poll config: %w", err)

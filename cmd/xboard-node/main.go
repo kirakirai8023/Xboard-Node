@@ -123,8 +123,9 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 				case sig = <-sigCh:
 					nlog.Core().Warn("received second signal, forcing exit", "signal", sig)
 					os.Exit(1)
-				case <-time.After(15 * time.Second):
-					nlog.Core().Error("shutdown timed out after 15s, forcing exit")
+				// Allow an in-flight 30s report and a final 30s report to finish.
+				case <-time.After(75 * time.Second):
+					nlog.Core().Error("shutdown timed out after 75s, forcing exit")
 					os.Exit(2)
 				}
 			case <-ctx.Done():
