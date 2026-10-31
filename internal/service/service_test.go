@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+
 package service
 
 import (
@@ -9,11 +11,49 @@ import (
 
 	"github.com/kirakirai8023/Xboard-Node/internal/cert"
 	"github.com/kirakirai8023/Xboard-Node/internal/config"
+	"github.com/kirakirai8023/Xboard-Node/internal/controlplane"
 	"github.com/kirakirai8023/Xboard-Node/internal/kernel"
 	"github.com/kirakirai8023/Xboard-Node/internal/limiter"
 	"github.com/kirakirai8023/Xboard-Node/internal/model"
 	"golang.org/x/time/rate"
 )
+
+func TestQueuedWSEvents_CoalescesUserChanges(t *testing.T) {
+	k := &fakeKernel{running: true}
+	s := newTestService(k)
+	s.wsEvents = make(chan controlplane.Event, 16)
+	s.updateUserState([]model.UserSpec{{ID: 1, UUID: "old"}})
+	s.wsEvents <- controlplane.Event{Type: controlplane.EventSyncUserDelta, DeltaAction: "add", DeltaUsers: []model.UserSpec{{ID: 2, UUID: "new"}}}
+	s.wsEvents <- controlplane.Event{Type: controlplane.EventSyncUserDelta, DeltaAction: "add", DeltaUsers: []model.UserSpec{{ID: 3, UUID: "third"}}}
+	s.handleQueuedWSEvents(context.Background(), controlplane.Event{Type: controlplane.EventSyncUsers, Users: []model.UserSpec{{ID: 1, UUID: "old"}}})
+	if k.updateCalls != 1 || len(s.lastUsers) != 3 {
+		t.Fatalf("updates=%d, users=%v", k.updateCalls, s.lastUsers)
+	}
+}
+
+func TestQueuedWSEvents_RevocationBeforeReauthorization(t *testing.T) {
+	k := &fakeKernel{running: true}
+	s := newTestService(k)
+	s.lastConfig = &model.NodeSpec{Protocol: "vless"}
+	s.wsEvents = make(chan controlplane.Event, 16)
+	users := []model.UserSpec{{ID: 1, UUID: "old"}}
+	s.updateUserState(users)
+	s.wsEvents <- controlplane.Event{Type: controlplane.EventSyncUsers, Users: users}
+	s.handleQueuedWSEvents(context.Background(), controlplane.Event{Type: controlplane.EventSyncUsers, Users: []model.UserSpec{}})
+	if !k.running || k.startCalls != 1 {
+		t.Fatal("revocation was skipped before the same user was authorized again")
+	}
+}
+
+func TestQueuedWSEvents_EmptySnapshotRevokesUsers(t *testing.T) {
+	k := &fakeKernel{running: true}
+	s := newTestService(k)
+	s.updateUserState([]model.UserSpec{{ID: 1, UUID: "old"}})
+	s.handleQueuedWSEvents(context.Background(), controlplane.Event{Type: controlplane.EventSyncUsers, Users: []model.UserSpec{}})
+	if k.running || len(s.lastUsers) != 0 {
+		t.Fatal("empty snapshot did not revoke users")
+	}
+}
 
 type fakeKernel struct {
 	running bool

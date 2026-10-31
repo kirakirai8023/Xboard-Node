@@ -7,9 +7,16 @@ package kernel_test
 import (
 	"bytes"
 	"context"
+	"crypto/ecdh"
+	"crypto/rand"
+	"crypto/tls"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
@@ -20,6 +27,8 @@ import (
 	"github.com/kirakirai8023/Xboard-Node/internal/kernel/singbox"
 	"github.com/kirakirai8023/Xboard-Node/internal/kernel/xray"
 	"github.com/kirakirai8023/Xboard-Node/internal/model"
+	xrayCore "github.com/xtls/xray-core/core"
+	xraySerial "github.com/xtls/xray-core/infra/conf/serial"
 	"golang.org/x/net/proxy"
 	"golang.org/x/time/rate"
 )
@@ -122,7 +131,7 @@ func TestOfficialKernelsTraffic(t *testing.T) {
 				defer next.Close()
 				active = next
 				roundTrip(t, next)
-				traffic, _, _, _ = nodeKernel.GetUserTraffic(context.Background())
+				traffic = awaitTraffic(t, nodeKernel, func(traffic map[int][2]int64) bool { return traffic[1][0] > previous[0] && traffic[1][1] > previous[1] })
 				if traffic[1][0] <= previous[0] || traffic[1][1] <= previous[1] {
 					t.Fatalf("replacement reset traffic counters: before=%v after=%v", previous, traffic[1])
 				}
@@ -154,6 +163,104 @@ func TestOfficialKernelsTraffic(t *testing.T) {
 			roundTrip(t, restored)
 		})
 	}
+}
+
+func awaitTraffic(t *testing.T, node kernel.Kernel, ready func(map[int][2]int64) bool) map[int][2]int64 {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		traffic, _, _, err := node.GetUserTraffic(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ready(traffic) {
+			return traffic
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("traffic counters did not settle: %v", traffic)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// Use a local TLS 1.3 target both for REALITY camouflage and HTTPS payloads.
+// No public DNS, external servers, production credentials or fixed ports.
+func TestXray_RealityVisionUnlimited(t *testing.T) {
+	payload := bytes.Repeat([]byte("vision-transfer\n"), 128*1024)
+	target := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(payload) }))
+	target.TLS = &tls.Config{MinVersion: tls.VersionTLS13, MaxVersion: tls.VersionTLS13}
+	target.StartTLS()
+	defer target.Close()
+	private, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverPort, clientPort := unusedPort(t), unusedPort(t)
+	targetAddress := target.Listener.Addr().String()
+	_, targetPortText, _ := net.SplitHostPort(targetAddress)
+	targetPort, _ := strconv.Atoi(targetPortText)
+	for _, mode := range []string{"auto", "compatible"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := config.KernelConfig{Type: "xray", LogLevel: "error", ConfigDir: t.TempDir(), XrayForwarding: mode,
+				CustomOutbound: []map[string]any{{"tag": "direct", "protocol": "freedom", "settings": map[string]any{"finalRules": []map[string]any{{"action": "allow", "ip": []string{"127.0.0.1/32"}, "port": targetPort}}}}}}
+			server := xray.New(cfg)
+			user := model.UserSpec{ID: 1, UUID: "11111111-1111-1111-1111-111111111111"}
+			node := &model.NodeSpec{Protocol: "vless", ListenIP: "127.0.0.1", ServerPort: serverPort, Network: "tcp", TLS: 2, Flow: "xtls-rprx-vision",
+				TLSSettings:      map[string]any{"private_key": base64.RawURLEncoding.EncodeToString(private.Bytes()), "short_id": "0123456789abcdef", "server_name": "example.com", "dest": targetAddress},
+				CustomRouteRules: []model.CustomRouteRule{{Match: model.RouteMatch{IPCIDRs: []string{"127.0.0.1/32"}}, Action: model.RouteAction{Type: "direct"}}}}
+			if err := server.Start(node, []model.UserSpec{user}, kernel.TLSCert{}); err != nil {
+				t.Fatal(err)
+			}
+			defer server.Stop()
+			clientConfig := map[string]any{"log": map[string]any{"loglevel": "error"},
+				"inbounds": []map[string]any{{"listen": "127.0.0.1", "port": clientPort, "protocol": "socks", "settings": map[string]any{"auth": "noauth"}}},
+				"outbounds": []map[string]any{{"protocol": "vless", "settings": map[string]any{"vnext": []map[string]any{{"address": "127.0.0.1", "port": serverPort, "users": []map[string]any{{"id": user.UUID, "flow": "xtls-rprx-vision", "encryption": "none"}}}}},
+					"streamSettings": map[string]any{"network": "tcp", "security": "reality", "realitySettings": map[string]any{"serverName": "example.com", "fingerprint": "chrome", "password": base64.RawURLEncoding.EncodeToString(private.PublicKey().Bytes()), "shortId": "0123456789abcdef"}}}}}
+			data, _ := json.Marshal(clientConfig)
+			protobuf, err := xraySerial.LoadJSONConfig(bytes.NewReader(data))
+			if err != nil {
+				t.Fatal(err)
+			}
+			client, err := xrayCore.New(protobuf)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = client.Start(); err != nil {
+				client.Close()
+				t.Fatal(err)
+			}
+			defer client.Close()
+			dialer, err := proxy.SOCKS5("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(clientPort)), nil, &net.Dialer{Timeout: 3 * time.Second})
+			if err != nil {
+				t.Fatal(err)
+			}
+			transport := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, DisableKeepAlives: true,
+				DialContext: dialer.(proxy.ContextDialer).DialContext}
+			defer transport.CloseIdleConnections()
+			httpClient := &http.Client{Transport: transport, Timeout: 10 * time.Second}
+			response, err := httpClient.Get(target.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := io.ReadAll(response.Body)
+			response.Body.Close()
+			if err != nil || !bytes.Equal(got, payload) {
+				t.Fatalf("Vision payload length=%d, error=%v", len(got), err)
+			}
+			awaitTraffic(t, server, func(traffic map[int][2]int64) bool { return traffic[1][0] > 0 && traffic[1][1] >= int64(len(payload)) })
+		})
+	}
+}
+
+func unusedPort(t *testing.T) int {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	listener.Close()
+	return port
 }
 
 func dialNode(t *testing.T, protocol, address, target, credential string) net.Conn {

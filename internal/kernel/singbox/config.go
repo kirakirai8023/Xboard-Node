@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+
 package singbox
 
 import (
@@ -60,6 +62,11 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 
 	// Merge panel routes and static config routes
 	cfg["route"] = buildRoutes(nc.Routes, nc.CustomRouteRules, mergeRouteList(nc.CustomRoutes, kcfg.CustomRoute))
+	if kcfg.Sniffing == "route_only" {
+		route := cfg["route"].(M)
+		sniff := M{"action": "sniff", "sniffer": []string{"http", "tls"}}
+		route["rules"] = append([]M{sniff}, route["rules"].([]M)...)
+	}
 
 	// Automatically enable rule_set caching (cache_file) when panel routes
 	// reference geoip:/geosite: entries so that the downloaded .srs rule_set

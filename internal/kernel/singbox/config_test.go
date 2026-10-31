@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+
 package singbox
 
 import (
@@ -10,6 +12,14 @@ import (
 	"github.com/kirakirai8023/Xboard-Node/internal/model"
 	"github.com/kirakirai8023/Xboard-Node/internal/panel"
 )
+
+func TestBuildConfig_RouteOnlySniffing(t *testing.T) {
+	cfg := buildConfig(config.KernelConfig{Sniffing: "route_only"}, &model.NodeSpec{Protocol: "vless", ServerPort: 443}, testUsers, kernel.TLSCert{})
+	rules := cfg["route"].(M)["rules"].([]M)
+	if len(rules) == 0 || rules[0]["action"] != "sniff" {
+		t.Fatalf("missing native sniff action: %v", rules)
+	}
+}
 
 var testUsersPanel = []panel.User{
 	{ID: 1, UUID: "aaaaaaaa-1111-2222-3333-444444444444", SpeedLimit: 0, DeviceLimit: 0},

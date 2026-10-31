@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+
 package config
 
 import (
@@ -15,6 +17,38 @@ func writeTemp(t *testing.T, content string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func TestLoad_ForwardingAndSniffing(t *testing.T) {
+	for _, tc := range []struct {
+		backend, forwarding, sniffing string
+		valid                         bool
+	}{
+		{"xray", "auto", "off", true},
+		{"xray", "compatible", "route_only", true},
+		{"xray", "auto", "override_destination", true},
+		{"singbox", "auto", "route_only", true},
+		{"singbox", "auto", "override_destination", false},
+		{"xray", "invalid", "off", false},
+		{"xray", "auto", "invalid", false},
+	} {
+		t.Run(tc.backend+"/"+tc.forwarding+"/"+tc.sniffing, func(t *testing.T) {
+			path := writeTemp(t, fmt.Sprintf("panel:\n  url: https://panel.example.com\n  token: test\n  node_id: 1\nkernel:\n  type: %s\n  xray_forwarding: %s\n  sniffing: %s\n", tc.backend, tc.forwarding, tc.sniffing))
+			cfg, err := Load(path)
+			if (err == nil) != tc.valid {
+				t.Fatalf("Load() error = %v, valid = %v", err, tc.valid)
+			}
+			if err == nil && (cfg.Kernel.XrayForwarding != tc.forwarding || cfg.Kernel.Sniffing != tc.sniffing) {
+				t.Fatal("forwarding settings were not retained")
+			}
+		})
+	}
+	parent := &Config{Kernel: KernelConfig{XrayForwarding: "compatible", Sniffing: "route_only"}}
+	child := &Config{}
+	child.inheritFrom(parent)
+	if child.Kernel.XrayForwarding != "compatible" || child.Kernel.Sniffing != "route_only" {
+		t.Fatal("missing inherited forwarding options")
+	}
 }
 
 func TestLoad_ValidConfig(t *testing.T) {

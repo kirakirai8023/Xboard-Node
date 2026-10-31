@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+
 package xray
 
 import (
@@ -119,6 +121,18 @@ func TestXrayGetUserTrafficUsesBuiltInStatsAndDispatcherState(t *testing.T) {
 	}
 }
 
+func TestXrayTraffic_RevokedUserFinalCounters(t *testing.T) {
+	x, mgr := newStatsBackedXray(t, []model.UserSpec{{ID: 1, UUID: "u"}}, nil)
+	counter := mustRegisterCounter(t, mgr, counterName(1, "downlink"))
+	_, _, _, _ = x.GetUserTraffic(context.Background())
+	x.users = nil
+	counter.Add(12345)
+	traffic, _, _, err := x.GetUserTraffic(context.Background())
+	if err != nil || traffic[1][1] != 12345 {
+		t.Fatalf("late counter flush = %v, %v", traffic, err)
+	}
+}
+
 func TestXrayUpdateDispatcherLimitsPropagatesDeviceMetadata(t *testing.T) {
 	x := New(config.KernelConfig{Type: "xray"})
 	ld := newTestDispatcher()
@@ -167,10 +181,10 @@ func TestXraySetSpeedLimitFuncBeforeStart(t *testing.T) {
 func TestXrayCapabilities(t *testing.T) {
 	x := New(config.KernelConfig{Type: "xray"})
 	caps := x.Capabilities()
-	if !caps.PerUserSpeedLimit || !caps.DeviceLimit || !caps.BuiltInTrafficStats || !caps.AliveIPTracking {
+	if !caps.PerUserSpeedLimit || !caps.DeviceLimit || !caps.BuiltInTrafficStats || !caps.AliveIPTracking || !caps.ForceCloseUser {
 		t.Fatalf("unexpected positive xray capabilities: %+v", caps)
 	}
-	if caps.ForceCloseConnection || caps.ForceCloseUser {
+	if caps.ForceCloseConnection {
 		t.Fatalf("unexpected force-close xray capabilities: %+v", caps)
 	}
 }

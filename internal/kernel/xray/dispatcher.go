@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+
 package xray
 
 import (
@@ -76,6 +78,10 @@ type LimitDispatcher struct {
 	deviceLimits map[string]int            // email → max devices
 	emailToUID   map[string]int            // email → panel user ID
 	speedLimits  map[string]*rate.Limiter  // email/UUID → shared limiter
+	bandwidth    map[string]*atomic.Pointer[rate.Limiter]
+	connections  map[string]map[*managedLink]struct{}
+	compatible   bool // immutable after the instance starts
+	closed       bool
 
 	// unlimitedIPs: users without device limit — sync.Map for lock-free access.
 	// Each entry is *ipCounter{ips sync.Map}.
@@ -115,6 +121,22 @@ func (d *LimitDispatcher) Dispatch(ctx context.Context, dest net.Destination) (*
 	if email == "" {
 		return d.innerDisp.Dispatch(ctx, dest)
 	}
+	ctx, cancel := context.WithCancel(ctx)
+	if !d.compatible && d.speedLimiter(email) == nil {
+		link, err := d.innerDisp.Dispatch(ctx, dest)
+		if err != nil {
+			cancel()
+			if isTCP {
+				d.delConn(email, sourceIP)
+			}
+			return nil, err
+		}
+		if !d.trackManagedLink(ctx, cancel, link, email, sourceIP, isTCP, true) {
+			return nil, errors.New("dispatcher closed")
+		}
+		return link, nil
+	}
+	ctx = disableSplice(ctx)
 
 	// Own both pipe ends so both directions can be throttled at writes,
 	// without changing the concrete reader returned to mux/XUDP callers.
@@ -125,7 +147,11 @@ func (d *LimitDispatcher) Dispatch(ctx context.Context, dest net.Destination) (*
 		Reader: downReader,
 		Writer: d.limitWriter(ctx, email, upWriter),
 	}
-	d.trackLink(link, email, sourceIP, isTCP)
+	if !d.trackManagedLink(ctx, cancel, link, email, sourceIP, isTCP, false) {
+		common.Interrupt(upReader)
+		common.Interrupt(downWriter)
+		return nil, errors.New("dispatcher closed")
+	}
 	outbound := &transport.Link{
 		Reader: upReader,
 		Writer: d.limitWriter(ctx, email, downWriter),
@@ -150,11 +176,28 @@ func (d *LimitDispatcher) DispatchLink(ctx context.Context, dest net.Destination
 	if email == "" {
 		return d.innerDisp.DispatchLink(ctx, dest, link)
 	}
-	d.trackLink(link, email, sourceIP, isTCP)
+	ctx, cancel := context.WithCancel(ctx)
+	forwarded := *link
+	native := !d.compatible && d.speedLimiter(email) == nil
+	if !native {
+		ctx = disableSplice(ctx)
+	}
+	if !d.trackManagedLink(ctx, cancel, &forwarded, email, sourceIP, isTCP, native) {
+		return errors.New("dispatcher closed")
+	}
+	if native {
+		err := d.innerDisp.DispatchLink(ctx, dest, &forwarded)
+		if err != nil {
+			common.Interrupt(forwarded.Writer)
+			cancel()
+		}
+		return err
+	}
 	// Do not replace the caller's reader: mux owns its concrete pipe type.
+	state := d.bandwidthState(email)
 	limited := &transport.Link{
-		Reader: &bandwidthReader{Reader: link.Reader, ctx: ctx, limiter: func() *rate.Limiter { return d.speedLimiter(email) }},
-		Writer: d.limitWriter(ctx, email, link.Writer),
+		Reader: &bandwidthReader{Reader: forwarded.Reader, ctx: ctx, limiter: state.Load},
+		Writer: d.limitWriter(ctx, email, forwarded.Writer),
 	}
 	err = d.innerDisp.DispatchLink(ctx, dest, limited)
 	if err != nil {
@@ -176,13 +219,24 @@ func (d *LimitDispatcher) canonicalUserContext(ctx context.Context) context.Cont
 	if uid == 0 {
 		return ctx
 	}
+	if inbound.User.Email == userEmail(uid) {
+		// Vision updates this session's readiness after its handshake. Keep
+		// the original session shared with the protocol and outbound.
+		return ctx
+	}
 	copyInbound, copyUser := *inbound, *inbound.User
 	copyUser.Email = userEmail(uid)
 	copyInbound.User = &copyUser
-	// Kernel splice bypasses buf.Reader/Writer wrappers on Linux. Keep
-	// managed users on the accounting/limiting path, including live updates.
-	copyInbound.CanSpliceCopy = 3
 	return session.ContextWithInbound(ctx, &copyInbound)
+}
+
+func disableSplice(ctx context.Context) context.Context {
+	if inbound := session.InboundFromContext(ctx); inbound != nil {
+		copyInbound := *inbound
+		copyInbound.CanSpliceCopy = 3
+		return session.ContextWithInbound(ctx, &copyInbound)
+	}
+	return ctx
 }
 
 // identifyAndCheck extracts user identity from the session context, enforces
@@ -208,18 +262,91 @@ func (d *LimitDispatcher) identifyAndCheck(ctx context.Context, dest net.Destina
 // transport primitives. This keeps mux/XUDP compatible while still allowing
 // the dispatcher to release device-limit state when the link closes.
 func (d *LimitDispatcher) trackLink(link *transport.Link, email, sourceIP string, isTCP bool) {
-	d.connCount.Add(1)
+	ctx, cancel := context.WithCancel(context.Background())
+	d.trackManagedLink(ctx, cancel, link, email, sourceIP, isTCP, false)
+}
 
+type managedLink struct {
+	native bool
+	close  func()
+}
+
+func (d *LimitDispatcher) trackManagedLink(ctx context.Context, cancel context.CancelFunc, link *transport.Link, email, sourceIP string, isTCP, native bool) bool {
+	record := &managedLink{native: native}
+	var once sync.Once
 	onClose := func() {
+		once.Do(func() {
+			cancel()
+			if isTCP {
+				d.delConn(email, sourceIP)
+			}
+			d.connCount.Add(-1)
+			d.mu.Lock()
+			delete(d.connections[email], record)
+			if len(d.connections[email]) == 0 {
+				delete(d.connections, email)
+			}
+			d.mu.Unlock()
+		})
+	}
+	reader, writer := link.Reader, link.Writer
+	inbound := session.InboundFromContext(ctx)
+	record.close = func() {
+		cancel()
+		// Splice may bypass the link, so also interrupt the physical socket.
+		if inbound != nil && inbound.Conn != nil {
+			_ = inbound.Conn.Close()
+		}
+		common.Interrupt(reader)
+		common.Interrupt(writer)
+		onClose()
+	}
+	d.mu.Lock()
+	if d.closed {
+		d.mu.Unlock()
+		cancel()
+		if inbound != nil && inbound.Conn != nil {
+			_ = inbound.Conn.Close()
+		}
+		common.Interrupt(reader)
+		common.Interrupt(writer)
 		if isTCP {
 			d.delConn(email, sourceIP)
 		}
-		d.connCount.Add(-1)
+		return false
 	}
+	d.connCount.Add(1)
+	if d.connections == nil {
+		d.connections = make(map[string]map[*managedLink]struct{})
+	}
+	if d.connections[email] == nil {
+		d.connections[email] = make(map[*managedLink]struct{})
+	}
+	d.connections[email][record] = struct{}{}
+	// Cover a limit update racing with native dispatch before registration.
+	limited := native && d.speedLimits[email] != nil
+	d.mu.Unlock()
 
 	link.Writer = &closeTrackingWriter{
 		Writer:  link.Writer,
 		onClose: onClose,
+	}
+	context.AfterFunc(ctx, onClose)
+	if limited {
+		record.close()
+	}
+	return true
+}
+
+func (d *LimitDispatcher) CloseUser(email string) {
+	d.mu.RLock()
+	var records []*managedLink
+	for record := range d.connections[email] {
+		records = append(records, record)
+	}
+	d.mu.RUnlock()
+	for _, record := range records {
+		record.close()
 	}
 }
 
@@ -235,6 +362,7 @@ func (d *LimitDispatcher) Start() error {
 }
 
 func (d *LimitDispatcher) Close() error {
+	d.ResetConns()
 	if c, ok := d.inner.(interface{ Close() error }); ok {
 		return c.Close()
 	}
@@ -252,6 +380,18 @@ func (d *LimitDispatcher) UpdateLimits(emailToUID map[string]int, deviceLimits, 
 }
 
 func (d *LimitDispatcher) ResetConns() {
+	d.mu.Lock()
+	d.closed = true
+	var records []*managedLink
+	for _, connections := range d.connections {
+		for record := range connections {
+			records = append(records, record)
+		}
+	}
+	d.mu.Unlock()
+	for _, record := range records {
+		record.close()
+	}
 	d.mu.Lock()
 	d.limitedIPs = make(map[string]map[string]int)
 	d.mu.Unlock()
@@ -271,7 +411,6 @@ func (d *LimitDispatcher) GetConnectionState() (aliveIPs map[int]map[string]bool
 	d.mu.RLock()
 	emailToUID := d.emailToUID
 	limitedIPs := d.limitedIPs
-	d.mu.RUnlock()
 
 	aliveIPs = make(map[int]map[string]bool)
 
@@ -289,6 +428,7 @@ func (d *LimitDispatcher) GetConnectionState() (aliveIPs map[int]map[string]bool
 			aliveIPs[uid] = ipSet
 		}
 	}
+	d.mu.RUnlock()
 
 	// Collect IPs from unlimited users (lock-free).
 	d.unlimitedIPs.Range(func(key, value interface{}) bool {

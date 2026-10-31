@@ -1,7 +1,10 @@
+// SPDX-License-Identifier: MPL-2.0
+
 package singbox
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"sync"
@@ -32,6 +35,7 @@ type SingBox struct {
 	users      []model.UserSpec
 	nodeConfig *model.NodeSpec
 	tls        kernel.TLSCert
+	configHash [32]byte
 
 	// connTracker is our lightweight in-process byte/IP tracker.
 	// Survives instance replacement to preserve cumulative traffic counters.
@@ -101,6 +105,12 @@ func (s *SingBox) startLocked(nodeConfig *model.NodeSpec, users []model.UserSpec
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
+	hash := sha256.Sum256(data)
+	if s.box != nil && hash == s.configHash {
+		s.connTracker.SetUserMap(buildUserMap(users))
+		s.users, s.nodeConfig, s.tls = users, nodeConfig, tls
+		return nil
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	ctx = include.Context(ctx)
 	opts, err := singJSON.UnmarshalExtendedContext[option.Options](ctx, data)
@@ -130,6 +140,7 @@ func (s *SingBox) startLocked(nodeConfig *model.NodeSpec, users []model.UserSpec
 		return fmt.Errorf("start sing-box: %w", err)
 	}
 	s.box, s.cancel = instance, cancel
+	s.configHash = hash
 	s.users, s.nodeConfig, s.tls = users, nodeConfig, tls
 	nlog.Core().Debug("sing-box started", "users", len(users))
 	return nil

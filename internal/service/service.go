@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+
 package service
 
 import (
@@ -239,9 +241,68 @@ func (s *Service) Run(ctx context.Context) error {
 			s.drainMachineMailbox(ctx)
 
 		case event := <-s.wsEvents:
+			s.handleQueuedWSEvents(ctx, event)
+		}
+	}
+}
+
+// Coalesce only events already queued, with a fixed bound and no debounce
+// delay. Only genuine additions are combined; snapshots, revocations,
+// credential/limit changes, and configuration/device events are barriers.
+func (s *Service) handleQueuedWSEvents(ctx context.Context, first controlplane.Event) {
+	events := []controlplane.Event{first}
+drain:
+	for len(events) < 16 {
+		select {
+		case event := <-s.wsEvents:
+			events = append(events, event)
+		default:
+			break drain
+		}
+	}
+	var users []model.UserSpec
+	pending := false
+	flush := func() {
+		if pending {
+			hash := computeUserHash(users)
+			if hash != s.lastUserHash {
+				s.applyUserUpdate(ctx, users, hash)
+			}
+			pending = false
+		}
+	}
+	for _, event := range events {
+		base := s.lastUsers
+		if pending {
+			base = users
+		}
+		if event.Type == controlplane.EventSyncUserDelta && len(event.DeltaUsers) > 0 &&
+			event.DeltaAction == "add" && newUsersOnly(base, event.DeltaUsers) {
+			if !pending {
+				users = append([]model.UserSpec{}, s.lastUsers...)
+			}
+			users = mergeUsers(users, event.DeltaUsers)
+			pending = true
+		} else {
+			flush()
 			s.handleWSEvent(ctx, event)
 		}
 	}
+	flush()
+}
+
+func newUsersOnly(users, delta []model.UserSpec) bool {
+	ids := make(map[int]bool, len(users))
+	for _, user := range users {
+		ids[user.ID] = true
+	}
+	for _, user := range delta {
+		if ids[user.ID] {
+			return false
+		}
+		ids[user.ID] = true
+	}
+	return true
 }
 
 func (s *Service) initialSetup(ctx context.Context) error {

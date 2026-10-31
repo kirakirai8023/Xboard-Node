@@ -1,9 +1,13 @@
+// SPDX-License-Identifier: MPL-2.0
+
 package xray
 
 import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/kirakirai8023/Xboard-Node/internal/config"
@@ -11,6 +15,40 @@ import (
 	"github.com/kirakirai8023/Xboard-Node/internal/model"
 	"github.com/kirakirai8023/Xboard-Node/internal/panel"
 )
+
+func TestBuildConfig_CustomPolicyPreservesAccounting(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "custom.json")
+	if err := os.WriteFile(path, []byte(`{"policy":{"levels":{"0":{"bufferSize":64,"connIdle":30,"statsUserUplink":false,"statsUserDownlink":false}},"system":{"statsOutboundDownlink":false}}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := buildConfig(config.KernelConfig{CustomConfig: path}, &model.NodeSpec{Protocol: "vless", ServerPort: 443}, testUsers, kernel.TLSCert{})
+	policy := cfg["policy"].(M)
+	level := policy["levels"].(M)["0"].(M)
+	if level["bufferSize"] != float64(64) || level["connIdle"] != float64(30) {
+		t.Fatalf("custom policy = %v", level)
+	}
+	if level["statsUserUplink"] != true || level["statsUserDownlink"] != true || policy["system"].(M)["statsOutboundDownlink"] != true {
+		t.Fatal("custom policy disabled accounting")
+	}
+}
+
+func TestBuildConfig_SniffingModes(t *testing.T) {
+	for _, mode := range []string{"", "off", "route_only", "override_destination"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := buildConfig(config.KernelConfig{Sniffing: mode}, &model.NodeSpec{Protocol: "vless", ServerPort: 443}, testUsers, kernel.TLSCert{})
+			sniff, exists := cfg["inbounds"].([]M)[0]["sniffing"].(M)
+			if mode == "" || mode == "off" {
+				if exists {
+					t.Fatal("sniffing should remain disabled")
+				}
+				return
+			}
+			if !exists || sniff["enabled"] != true || sniff["routeOnly"] != (mode == "route_only") {
+				t.Fatalf("sniffing = %v", sniff)
+			}
+		})
+	}
+}
 
 var testKernelCfg = config.KernelConfig{
 	Type:     "xray",

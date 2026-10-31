@@ -1,10 +1,14 @@
+// SPDX-License-Identifier: MPL-2.0
+
 package singbox
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net"
 	"net/netip"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,6 +17,64 @@ import (
 	singM "github.com/sagernet/sing/common/metadata"
 	"golang.org/x/time/rate"
 )
+
+func TestConnTracker_LargeCountBatch(t *testing.T) {
+	tracker := NewConnTracker(0)
+	tracker.SetUserMap(map[string]int{"u": 1})
+	tracker.SetSpeedLimitFunc(func(string) *rate.Limiter { return rate.NewLimiter(1<<30, 64*1024) })
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	conn := tracker.RoutedConnection(ctx, &testConn{}, testInboundContext("u", "127.0.0.1"), nil, nil).(*trackedConn)
+	defer conn.Close()
+	var counter atomic.Int64
+	conn.makeCountFunc(&counter)(1 << 20)
+	if ctx.Err() != nil || counter.Load() != 1<<20 {
+		t.Fatalf("large copy batch failed: context=%v, bytes=%d", ctx.Err(), counter.Load())
+	}
+}
+
+func TestRateLimitedWriter_LargeWriteIsComplete(t *testing.T) {
+	var sink bytes.Buffer
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	writer := &RateLimitedWriter{writer: &sink, limiter: rate.NewLimiter(1<<30, 4096), ctx: ctx}
+	data := bytes.Repeat([]byte("x"), 128*1024)
+	n, err := writer.Write(data)
+	if err != nil || n != len(data) || !bytes.Equal(sink.Bytes(), data) {
+		t.Fatalf("Write() = (%d,%v), output=%d", n, err, sink.Len())
+	}
+}
+
+func TestConnTracker_LiveLimitTransitions(t *testing.T) {
+	tracker := NewConnTracker(0)
+	tracker.SetUserMap(map[string]int{"u": 1, "other": 2})
+	var current atomic.Pointer[rate.Limiter]
+	tracker.SetSpeedLimitFunc(func(uuid string) *rate.Limiter {
+		if uuid == "u" {
+			return current.Load()
+		}
+		return nil
+	})
+	base, other := &testConn{}, &testConn{}
+	tracked := tracker.RoutedConnection(context.Background(), base, testInboundContext("u", "127.0.0.1"), nil, nil).(*trackedConn)
+	second := tracker.RoutedConnection(context.Background(), other, testInboundContext("other", "127.0.0.1"), nil, nil)
+	defer second.Close()
+	current.Store(rate.NewLimiter(1000, 1000))
+	tracker.SetUserMap(map[string]int{"u": 1, "other": 2})
+	if !base.closed || other.closed {
+		t.Fatal("enabling a limit must reconnect only the affected user")
+	}
+	if !tracked.closed.Load() {
+		t.Fatal("closed connection did not release its lifecycle state")
+	}
+	limited := tracker.RoutedConnection(context.Background(), &testConn{}, testInboundContext("u", "127.0.0.1"), nil, nil).(*trackedConn)
+	defer limited.Close()
+	current.Store(nil)
+	tracker.SetUserMap(map[string]int{"u": 1, "other": 2})
+	if limited.currentLimiter() != nil || limited.closed.Load() {
+		t.Fatal("removing a limit should preserve the connection and clear its limiter")
+	}
+}
 
 func TestSingBoxCapabilities(t *testing.T) {
 	s := New(config.KernelConfig{Type: "sing-box"})

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+
 package xray
 
 import (
@@ -70,6 +72,13 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 
 	inbound := buildInbound(nc, users, tc)
 	if inbound != nil {
+		if kcfg.Sniffing != "" && kcfg.Sniffing != "off" {
+			inbound["sniffing"] = M{
+				"enabled":      true,
+				"destOverride": []string{"http", "tls"},
+				"routeOnly":    kcfg.Sniffing == "route_only",
+			}
+		}
 		cfg["inbounds"] = []M{inbound}
 	} else {
 		nlog.Core().Warn("xray: unsupported protocol, no inbound configured — node will not accept connections",
@@ -129,6 +138,9 @@ func mergeCustomXray(cfg M, kcfg config.KernelConfig) {
 	if v, ok := custom["dns"]; ok {
 		cfg["dns"] = v
 	}
+	if policy, ok := custom["policy"].(map[string]any); ok {
+		mergeXrayPolicy(cfg["policy"].(M), policy)
+	}
 
 	// outbounds — append custom entries
 	if v, ok := custom["outbounds"]; ok {
@@ -154,6 +166,33 @@ func mergeCustomXray(cfg M, kcfg config.KernelConfig) {
 		if !protected[k] {
 			cfg[k] = v
 		}
+	}
+}
+
+// Retain the accounting flags required by the control plane while allowing
+// connection timeouts, buffer sizes and other native policy settings.
+func mergeXrayPolicy(dst, src M) {
+	for key, value := range src {
+		if strings.HasPrefix(key, "stats") {
+			if enabled, ok := dst[key].(bool); ok && enabled {
+				continue
+			}
+		}
+		if _, exists := dst[key].(map[string]any); exists {
+			if _, valid := value.(map[string]any); !valid {
+				continue
+			}
+		}
+		if child, ok := value.(map[string]any); ok {
+			existing, ok := dst[key].(map[string]any)
+			if !ok {
+				existing = M{}
+				dst[key] = existing
+			}
+			mergeXrayPolicy(existing, child)
+			continue
+		}
+		dst[key] = value
 	}
 }
 

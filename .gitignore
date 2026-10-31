@@ -1,7 +1,13 @@
 # Binaries
+/dist/
+/build.bat
 /xboard-node
 /xboard-node-linux-*
 *.exe
+
+# Local documentation and helper scripts
+*.md
+/scripts/
 
 # Config files (may contain secrets)
 config.yml

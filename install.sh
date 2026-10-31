@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MPL-2.0
 set -Eeuo pipefail
 
 RED='\033[0;31m'
@@ -33,6 +34,8 @@ ACTION="${DEFAULT_ACTION}"
 MODE=""
 PANEL_URL=""
 TOKEN=""
+TOKEN_FILE=""
+SKIP_DEPENDENCIES=0
 NODE_ID=""
 NODE_TYPE=""
 MACHINE_ID=""
@@ -55,6 +58,7 @@ TMP_DIR=""
 BACKUP_PATH=""
 SERVICE_EXISTED=0
 CLEANUP_DONE=0
+MUTATION_STARTED=0
 
 log_info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
@@ -147,15 +151,26 @@ on_error() {
     local line_no=${1:-unknown}
     if [ "$exit_code" -ne 0 ]; then
         log_error "Install failed at line ${line_no} (exit=${exit_code})"
-        if [ -n "$BACKUP_PATH" ]; then
+        if [ "$MUTATION_STARTED" -eq 1 ] && [ -n "$BACKUP_PATH" ]; then
             rollback_install || true
         fi
     fi
     cleanup_tmp
     exit "$exit_code"
 }
+on_signal() {
+    local exit_code=$1
+    trap - ERR INT TERM
+    if [ "$MUTATION_STARTED" -eq 1 ] && [ -n "$BACKUP_PATH" ]; then
+        rollback_install || true
+    fi
+    cleanup_tmp
+    exit "$exit_code"
+}
 trap 'on_error $LINENO' ERR
 trap cleanup_tmp EXIT
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
 
 usage() {
     cat <<'HELP'
@@ -176,6 +191,7 @@ usage() {
   REQUIRED FOR NODE MODE:
     --panel, -a      Panel URL
     --token, -t      Panel server token
+    --token-file     Read the token from a protected file instead of an argument
     --node-id, -n    Node ID
 
   REQUIRED FOR MACHINE MODE:
@@ -189,6 +205,7 @@ usage() {
     --version           Release version or latest (default: latest)
     --binary            Use a local xboard-node binary path instead of downloading
     --xbctl-binary      Use a local xbctl binary path instead of downloading
+    --skip-dependencies Use already-installed dependencies (local/offline deployment)
     --health-port       Local health port (default: 65530, use 0 to disable)
     --gomemlimit        Runtime GOMEMLIMIT value, e.g. 256MiB
     --gogc              Runtime GOGC value, e.g. 50
@@ -224,6 +241,14 @@ parse_args() {
             --token|-t)
                 TOKEN="$2"
                 shift 2
+                ;;
+            --token-file)
+                TOKEN_FILE="$2"
+                shift 2
+                ;;
+            --skip-dependencies)
+                SKIP_DEPENDENCIES=1
+                shift
                 ;;
             --node-id|-n)
                 NODE_ID="$2"
@@ -287,6 +312,15 @@ parse_args() {
                 ;;
         esac
     done
+
+    if [ -n "$TOKEN_FILE" ]; then
+        if [ -n "$TOKEN" ] || [ ! -f "$TOKEN_FILE" ]; then
+            log_error "Use either --token or an existing --token-file"
+            exit 1
+        fi
+        TOKEN=$(<"$TOKEN_FILE")
+        TOKEN=${TOKEN%$'\r'}
+    fi
 
     if [ ${#positional[@]} -gt 0 ] && [ "$ACTION" = "install" ]; then
         ACTION="${positional[0]}"
@@ -544,13 +578,16 @@ stage_xbctl() {
 }
 
 render_config() {
+    # Do not expose the token in the xbctl process arguments.
+    printf '%s' "$TOKEN" > "$TMP_DIR/token"
+    chmod 600 "$TMP_DIR/token"
     local init_args=(
         config init
         --mode "$MODE"
         --panel-url "$PANEL_URL"
         --kernel "${KERNEL_TYPE:-singbox}"
         --health-port "${HEALTH_PORT:-0}"
-        --token "$TOKEN"
+        --token-file "$TMP_DIR/token"
         --version "$RELEASE_VERSION"
         --output "$TMP_DIR/config.yml"
         --credentials-out "$TMP_DIR/credentials.env"
@@ -713,8 +750,10 @@ perform_install() {
     render_config
     render_service
     backup_existing_state
+    MUTATION_STARTED=1
     install_staged_files
     start_service
+    MUTATION_STARTED=0
 
     log_info "Installation succeeded"
     log_info "Service: ${SERVICE_NAME}"
@@ -733,12 +772,15 @@ perform_upgrade() {
         perform_install
         return
     fi
+    load_health_port_from_config "$CONFIG_FILE"
     TMP_DIR=$(mktemp -d)
     ensure_dirs
     stage_binary
     stage_xbctl
     render_service
     backup_existing_state
+    MUTATION_STARTED=1
+    stop_existing_service
     install -m 755 "$TMP_DIR/xboard-node" "$BINARY_PATH"
     install -m 755 "$TMP_DIR/xbctl" "$CLI_PATH"
     ln -sf "$CLI_PATH" /usr/bin/xbctl 2>/dev/null || true
@@ -750,6 +792,7 @@ perform_upgrade() {
         show_recent_logs
         return 1
     fi
+    MUTATION_STARTED=0
     log_info "Upgrade succeeded"
 }
 
@@ -829,7 +872,9 @@ main() {
     detect_arch
     detect_os
     ensure_systemd
-    install_dependencies
+    if [ "$SKIP_DEPENDENCIES" -ne 1 ]; then
+        install_dependencies
+    fi
 
     case "$ACTION" in
         install)
@@ -849,4 +894,6 @@ main() {
     esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

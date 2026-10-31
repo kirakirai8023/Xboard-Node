@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+
 package main
 
 import (
@@ -92,13 +94,15 @@ type fileNodeConfig struct {
 }
 
 type fileKernelConfig struct {
-	Type         string           `yaml:"type"`
-	ConfigDir    string           `yaml:"config_dir"`
-	LogLevel     string           `yaml:"log_level,omitempty"`
-	GeoDataDir   string           `yaml:"geo_data_dir,omitempty"`
-	CustomConfig string           `yaml:"custom_config,omitempty"`
-	CustomRoute  []map[string]any `yaml:"custom_route,omitempty"`
-	CustomOut    []map[string]any `yaml:"custom_outbound,omitempty"`
+	Type           string           `yaml:"type"`
+	ConfigDir      string           `yaml:"config_dir"`
+	LogLevel       string           `yaml:"log_level,omitempty"`
+	GeoDataDir     string           `yaml:"geo_data_dir,omitempty"`
+	CustomConfig   string           `yaml:"custom_config,omitempty"`
+	CustomRoute    []map[string]any `yaml:"custom_route,omitempty"`
+	CustomOut      []map[string]any `yaml:"custom_outbound,omitempty"`
+	XrayForwarding string           `yaml:"xray_forwarding,omitempty"`
+	Sniffing       string           `yaml:"sniffing,omitempty"`
 }
 
 type fileLogConfig struct {
@@ -202,7 +206,7 @@ func printUsage() {
   xbctl list [--output text|json]
   xbctl instance list [--output text|json]
   xbctl instance get <id> [--output text|json]
-  xbctl config init --mode node|machine --panel-url URL --token TOKEN [flags]
+  xbctl config init --mode node|machine --panel-url URL (--token TOKEN | --token-file PATH) [flags]
   xbctl config health-port [--config PATH]
   xbctl service status|start|stop|restart|enable|disable|logs
   xbctl health
@@ -849,8 +853,9 @@ func writeRootConfig(path string, root *config.RootConfig) error {
 	if p.Log.Level != "" || p.Log.Output != "" {
 		out.Log = &fileLogConfig{Level: p.Log.Level, Output: p.Log.Output}
 	}
-	if p.Kernel.Type != "" || p.Kernel.LogLevel != "" {
-		out.Kernel = &fileKernelConfig{Type: p.Kernel.Type, LogLevel: p.Kernel.LogLevel}
+	if p.Kernel.Type != "" || p.Kernel.LogLevel != "" || p.Kernel.XrayForwarding != "" || p.Kernel.Sniffing != "" {
+		out.Kernel = &fileKernelConfig{Type: p.Kernel.Type, LogLevel: p.Kernel.LogLevel,
+			XrayForwarding: p.Kernel.XrayForwarding, Sniffing: p.Kernel.Sniffing}
 	}
 	if p.Node.PushInterval != 0 || p.Node.PullInterval != 0 || p.Node.TrackInterval != 0 || p.Node.DeviceReportInterval != 0 {
 		out.Node = &fileNodeConfig{
@@ -880,13 +885,15 @@ func writeRootConfig(path string, root *config.RootConfig) error {
 				NodeType: inst.Panel.NodeType,
 			},
 			Kernel: fileKernelConfig{
-				Type:         inst.Kernel.Type,
-				ConfigDir:    inst.Kernel.ConfigDir,
-				LogLevel:     inst.Kernel.LogLevel,
-				GeoDataDir:   inst.Kernel.GeoDataDir,
-				CustomConfig: inst.Kernel.CustomConfig,
-				CustomRoute:  inst.Kernel.CustomRoute,
-				CustomOut:    inst.Kernel.CustomOutbound,
+				Type:           inst.Kernel.Type,
+				ConfigDir:      inst.Kernel.ConfigDir,
+				LogLevel:       inst.Kernel.LogLevel,
+				GeoDataDir:     inst.Kernel.GeoDataDir,
+				CustomConfig:   inst.Kernel.CustomConfig,
+				CustomRoute:    inst.Kernel.CustomRoute,
+				CustomOut:      inst.Kernel.CustomOutbound,
+				XrayForwarding: inst.Kernel.XrayForwarding,
+				Sniffing:       inst.Kernel.Sniffing,
 			},
 			Log: fileLogConfig{
 				Level:  inst.Log.Level,
@@ -1229,11 +1236,15 @@ func runConfigInit(args []string) error {
 		gogc           int
 		installRoot    string
 		token          string
+		tokenFile      string
 		releaseVersion string
 	)
 
 	for i := 0; i < len(args); i++ {
 		if i+1 >= len(args) {
+			if args[i] == "--token-file" {
+				return errors.New("--token-file requires a file path")
+			}
 			break
 		}
 		switch args[i] {
@@ -1301,12 +1312,28 @@ func runConfigInit(args []string) error {
 		case "--token":
 			i++
 			token = args[i]
+		case "--token-file":
+			i++
+			tokenFile = args[i]
 		case "--version":
 			i++
 			releaseVersion = args[i]
 		}
 	}
 
+	if tokenFile != "" {
+		if token != "" {
+			return errors.New("use either --token or --token-file")
+		}
+		data, err := os.ReadFile(tokenFile)
+		if err != nil {
+			return errors.New("could not read token file")
+		}
+		token = strings.TrimRight(string(data), "\r\n")
+		if token == "" || strings.ContainsAny(token, "\r\n") {
+			return errors.New("token file must contain one nonempty line")
+		}
+	}
 	if mode == "" {
 		return errors.New("--mode is required (node or machine)")
 	}

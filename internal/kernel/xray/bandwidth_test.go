@@ -35,9 +35,7 @@ func TestBandwidthWriterHonorsCancellationAndUpdates(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Existing wrappers must pick up a refreshed limiter without reconnecting.
-	ld.mu.Lock()
-	delete(ld.speedLimits, email)
-	ld.mu.Unlock()
+	ld.UpdateSpeedLimits(map[string]*rate.Limiter{})
 	third := buf.New()
 	_, _ = third.Write([]byte("c"))
 	if err := writer.WriteMultiBuffer(buf.MultiBuffer{third}); err != nil {

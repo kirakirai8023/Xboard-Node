@@ -5,6 +5,7 @@ package xray
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
@@ -19,9 +20,52 @@ func (d *LimitDispatcher) speedLimiter(email string) *rate.Limiter {
 
 func (d *LimitDispatcher) limitWriter(ctx context.Context, email string, writer buf.Writer) buf.Writer {
 	ctx, cancel := context.WithCancel(ctx)
+	state := d.bandwidthState(email)
 	return &bandwidthWriter{
 		Writer: writer, ctx: ctx, cancel: cancel,
-		limiter: func() *rate.Limiter { return d.speedLimiter(email) },
+		limiter: state.Load,
+	}
+}
+
+// Each limited connection retains its user's atomic cell. Refreshing limits
+// does not require a global map lookup or mutex for every buffer.
+func (d *LimitDispatcher) bandwidthState(email string) *atomic.Pointer[rate.Limiter] {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.bandwidth == nil {
+		d.bandwidth = make(map[string]*atomic.Pointer[rate.Limiter])
+	}
+	state := d.bandwidth[email]
+	if state == nil {
+		state = new(atomic.Pointer[rate.Limiter])
+		state.Store(d.speedLimits[email])
+		d.bandwidth[email] = state
+	}
+	return state
+}
+
+func (d *LimitDispatcher) UpdateSpeedLimits(limits map[string]*rate.Limiter) {
+	d.mu.Lock()
+	d.speedLimits = limits
+	for email, state := range d.bandwidth {
+		state.Store(limits[email])
+		if _, exists := limits[email]; !exists {
+			delete(d.bandwidth, email)
+		}
+	}
+	var reconnect []*managedLink
+	for email, connections := range d.connections {
+		if limits[email] != nil {
+			for record := range connections {
+				if record.native {
+					reconnect = append(reconnect, record)
+				}
+			}
+		}
+	}
+	d.mu.Unlock()
+	for _, record := range reconnect {
+		record.close()
 	}
 }
 

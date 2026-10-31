@@ -24,3 +24,10 @@
 #       token: "machine-token-2"
 #     log:
 #       level: "debug"   # override for this instance only
+
+# Optional forwarding settings (see docs-performance.md):
+# kernel:
+#   type: "xray"
+#   xray_forwarding: "auto"  # compatible keeps managed traffic on the limiter path
+#   sniffing: "off"          # route_only; override_destination is Xray-only
+#   custom_config: "/etc/xboard-node/kernel.json"

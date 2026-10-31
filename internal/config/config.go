@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+
 package config
 
 import (
@@ -121,6 +123,11 @@ type KernelConfig struct {
 	Type      string `yaml:"type"` // "singbox" or "xray"
 	ConfigDir string `yaml:"config_dir"`
 	LogLevel  string `yaml:"log_level"`
+	// XrayForwarding selects native forwarding for unlimited users (auto),
+	// or keeps all managed traffic on the limiter-compatible path.
+	XrayForwarding string `yaml:"xray_forwarding,omitempty"`
+	// Sniffing controls domain detection: off, route_only, or override_destination.
+	Sniffing string `yaml:"sniffing,omitempty"`
 
 	// GeoDataDir is the directory that contains GeoIP/GeoSite database files.
 	// For sing-box: geoip.db and geosite.db (geoip2-format).
@@ -507,6 +514,12 @@ func (c *Config) inheritFrom(parent *Config) {
 	if c.Kernel.CustomConfig == "" {
 		c.Kernel.CustomConfig = parent.Kernel.CustomConfig
 	}
+	if c.Kernel.XrayForwarding == "" {
+		c.Kernel.XrayForwarding = parent.Kernel.XrayForwarding
+	}
+	if c.Kernel.Sniffing == "" {
+		c.Kernel.Sniffing = parent.Kernel.Sniffing
+	}
 	if len(c.Kernel.CustomOutbound) == 0 {
 		c.Kernel.CustomOutbound = parent.Kernel.CustomOutbound
 	}
@@ -726,6 +739,19 @@ func (c *Config) validate() error {
 	}
 	if c.Cert.AutoTLS && c.Cert.Domain == "" {
 		return fmt.Errorf("cert.domain is required when cert.auto_tls is enabled")
+	}
+	switch c.Kernel.XrayForwarding {
+	case "", "auto", "compatible":
+	default:
+		return fmt.Errorf("kernel.xray_forwarding must be 'auto' or 'compatible'")
+	}
+	switch c.Kernel.Sniffing {
+	case "", "off", "route_only", "override_destination":
+	default:
+		return fmt.Errorf("kernel.sniffing must be 'off', 'route_only', or 'override_destination'")
+	}
+	if c.Kernel.Type == "singbox" && c.Kernel.Sniffing == "override_destination" {
+		return fmt.Errorf("kernel.sniffing 'override_destination' requires the xray kernel; sing-box supports 'route_only'")
 	}
 	if c.Node.PushInterval < 0 {
 		return fmt.Errorf("node.push_interval must not be negative")
