@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Xboard-Node management shortcut
+set -euo pipefail
+
+menu=/etc/xboard-node/deploy.sh
+if [[ "$EUID" != 0 ]]; then
+    if ! command -v sudo >/dev/null 2>&1; then
+        printf '管理操作需要 root，请切换到 root 后运行 xb。\n' >&2
+        exit 1
+    fi
+    exec sudo -- /usr/local/bin/xb "$@"
+fi
+if [[ ! -f "$menu" ]]; then
+    printf '管理菜单尚未安装，请通过最新版安装包安装或升级。\n' >&2
+    exit 1
+fi
+case "${1:-}" in
+    update|upgrade) shift; set -- online-upgrade "$@" ;;
+esac
+exec bash "$menu" "$@"

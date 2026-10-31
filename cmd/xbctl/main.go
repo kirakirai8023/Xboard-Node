@@ -29,6 +29,7 @@ const (
 	defaultCredentialsPath = "/etc/xboard-node/credentials.env"
 	defaultBinaryPath      = "/usr/local/bin/xboard-node"
 	defaultCLIPath         = "/usr/local/bin/xbctl"
+	defaultShortcutPath    = "/usr/local/bin/xb"
 	serviceName            = "xboard-node.service"
 	serviceFilePath        = "/etc/systemd/system/xboard-node.service"
 	defaultInstallRoot     = "/etc/xboard-node"
@@ -565,6 +566,9 @@ func runUninstall(args []string) error {
 			warnings = append(warnings, fmt.Sprintf("remove %s: %v", p, err))
 		}
 	}
+	if err := removeManagementShortcut(defaultShortcutPath); err != nil {
+		warnings = append(warnings, fmt.Sprintf("remove xb shortcut: %v", err))
+	}
 
 	if purge {
 		if err := os.RemoveAll(defaultInstallRoot); err != nil {
@@ -586,6 +590,29 @@ func runUninstall(args []string) error {
 	}
 
 	fmt.Println("Uninstall complete")
+	return nil
+}
+
+func removeManagementShortcut(path string) error {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if line == "# Xboard-Node management shortcut" {
+			return os.Remove(path)
+		}
+	}
 	return nil
 }
 

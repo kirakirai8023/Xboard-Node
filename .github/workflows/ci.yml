@@ -102,7 +102,7 @@ jobs:
 
       - name: Check installation script syntax
         run: |
-          for file in install.sh deploy.sh online-install.sh; do
+          for file in install.sh deploy.sh online-install.sh xb; do
             bash -n "$file"
           done
 
@@ -165,11 +165,12 @@ jobs:
               source = pathlib.Path(f"{binary}-linux-{arch}")
               shutil.copy2(source, package / binary)
               shutil.copy2(source, output / source.name)
-          for name_in in ("install.sh", "deploy.sh", "online-install.sh", "config.yml.example", "LICENSE.md"):
+          for name_in in ("install.sh", "deploy.sh", "online-install.sh", "xb", "config.yml.example", "LICENSE.md"):
               text = pathlib.Path(name_in).read_text(encoding="utf-8-sig")
               (package / name_in).write_text(text, encoding="utf-8", newline="\n")
           for script in package.glob("*.sh"):
               script.chmod(0o755)
+          (package / "xb").chmod(0o755)
           shutil.copytree("LICENSES", package / "LICENSES")
           metadata = {
               "version": version, "os": "linux", "arch": arch,

@@ -9,6 +9,7 @@ INSTALL_ROOT=/etc/xboard-node
 BACKUP_ROOT=/var/backups/xboard-node
 NODE_PATH=/usr/local/bin/xboard-node
 CLI_PATH=/usr/local/bin/xbctl
+XB_PATH=/usr/local/bin/xb
 UNIT_PATH=/etc/systemd/system/xboard-node.service
 SERVICE=xboard-node.service
 LOCK_PATH=/run/lock/xboard-node-deploy.lock
@@ -132,6 +133,7 @@ snapshot() {
     fi
     [[ ! -f "$NODE_PATH" ]] || cp -p -- "$NODE_PATH" "$pending/bin/xboard-node" || return 1
     [[ ! -f "$CLI_PATH" ]] || cp -p -- "$CLI_PATH" "$pending/bin/xbctl" || return 1
+    if management_shortcut_owned; then cp -p -- "$XB_PATH" "$pending/bin/xb" || return 1; fi
     [[ ! -f "$UNIT_PATH" ]] || cp -p -- "$UNIT_PATH" "$pending/systemd/xboard-node.service" || return 1
     printf 'xboard-node-menu-backup-v1\n' > "$pending/COMPLETE" || return 1
     (cd -- "$pending" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS) || return 1
@@ -190,6 +192,14 @@ restore_files() {
     if [[ -f "$source/bin/xbctl" ]]; then
         install -m 755 "$source/bin/xbctl" "$CLI_PATH.new" && mv -f -- "$CLI_PATH.new" "$CLI_PATH" || return 1
     else rm -f -- "$CLI_PATH" || return 1; fi
+    if [[ -f "$source/bin/xb" ]]; then
+        if [[ -e "$XB_PATH" || -L "$XB_PATH" ]] && ! management_shortcut_owned; then
+            fail 'xb 命令已被其他程序占用，无法恢复。'; return 1
+        fi
+        install -m 755 "$source/bin/xb" "$XB_PATH" || return 1
+    elif management_shortcut_owned; then
+        rm -f -- "$XB_PATH" || return 1
+    fi
     if [[ -f "$source/systemd/xboard-node.service" ]]; then
         install -m 644 "$source/systemd/xboard-node.service" "$UNIT_PATH" || return 1
     else
@@ -270,9 +280,9 @@ install_local() {
     else options+=(--machine-id "$TARGET_ID"); fi
     bash "$BUNDLE_DIR/install.sh" "${options[@]}" || result=$?
     if [[ "$result" == 0 ]]; then
-        install -m 755 "$BUNDLE_DIR/deploy.sh" "$INSTALL_ROOT/deploy.sh" || return 1
         if [[ -n "$paused" ]] && confirm "新服务已启动，是否取消 $paused 的开机自启？"; then systemctl disable "$paused" || return 1; fi
         say "配置：$INSTALL_ROOT/config.yml；日志：journalctl -u $SERVICE -f"
+        say '管理菜单：xb'
     elif [[ -n "$paused" ]]; then
         systemctl start "$paused" || fail "请手动恢复 $paused。"
     fi
@@ -285,6 +295,22 @@ install_wizard() {
     cleanup_token
     return "$result"
 }
+management_shortcut_owned() {
+    [[ -f "$XB_PATH" && ! -L "$XB_PATH" ]] &&
+        grep -Fqx '# Xboard-Node management shortcut' "$XB_PATH"
+}
+
+online_upgrade() {
+    local helper="$INSTALL_ROOT/online-install.sh" version=latest
+    if [[ "${1:-}" == --version && $# == 2 ]]; then version=$2
+    elif [[ $# != 0 ]]; then fail '用法：xb update [--version VERSION]'; return 1; fi
+    [[ "$version" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$ ]] || { fail '版本号无效。'; return 1; }
+    [[ -f "$helper" ]] || { fail '在线更新入口缺失，请先用新版完整部署包升级一次。'; return 1; }
+    # The downloaded bundle acquires the deployment lock when it is applied.
+    # Do not hold that same lock while launching this nested deployment.
+    bash "$helper" --version "$version" upgrade
+}
+
 upgrade_local() {
     [[ -f "$INSTALL_ROOT/config.yml" && -f "$UNIT_PATH" ]] || { fail '请先安装，升级不会创建新配置。'; return 1; }
     need curl || return 1
@@ -292,8 +318,7 @@ upgrade_local() {
     confirm '使用此部署包升级程序并重启？现有配置将保留。' || return 0
     snapshot || return 1
     bash "$BUNDLE_DIR/install.sh" upgrade --binary "$NODE_FILE" --xbctl-binary "$CLI_FILE" --skip-dependencies || return 1
-    install -m 755 "$BUNDLE_DIR/install.sh" "$INSTALL_ROOT/install.sh" || return 1
-    install -m 755 "$BUNDLE_DIR/deploy.sh" "$INSTALL_ROOT/deploy.sh"
+    say '更新完成，输入 xb 可打开管理菜单。'
 }
 binding_add() {
     [[ -x "$CLI_PATH" ]] || { fail '请先安装。'; return 1; }
@@ -384,18 +409,19 @@ menu() {
     while true; do
         printf '\n%s\n' '========== Xboard-Node 部署管理 =========='
         say ' 1. 本地安装 / 部署向导（节点或机器模式）'
-        say ' 2. 使用新部署包升级（保留配置）'
+        say ' 2. 在线更新至最新正式版（保留配置）'
         say ' 3. 查看状态 / 版本 / 实例'
         say ' 4. 启动服务      5. 停止服务      6. 重启服务'
         say ' 7. 查看日志      8. 编辑配置      9. 实例管理'
         say '10. 创建备份     11. 恢复备份     12. 环境诊断'
         say '13. 安装依赖     14. 卸载保留配置 15. 完整卸载'
-        say '16. 开机自启     17. 取消自启      0. 退出'
+        say '16. 开机自启     17. 取消自启     18. 本地包升级'
+        say ' 0. 退出'
         read -r -p '请选择: ' choice || return 0
         case "$choice" in
             0) return 0 ;;
             1) install_wizard || say '部署未完成，请检查上方信息。' ;;
-            2) choose_bundle && with_lock upgrade_local || say '升级未完成，请检查上方信息。' ;;
+            2) online_upgrade || say '更新未完成，请检查上方信息。' ;;
             3) show_status ;;
             4) with_lock service_action start || true ;;
             5) with_lock service_action stop || true ;;
@@ -415,6 +441,7 @@ menu() {
             15) with_lock uninstall_local 1 || true ;;
             16) with_lock service_action enable || true ;;
             17) with_lock service_action disable || true ;;
+            18) choose_bundle && with_lock upgrade_local || say '升级未完成，请检查上方信息。' ;;
             *) say '请选择菜单中的编号。' ;;
         esac
     done
@@ -422,6 +449,7 @@ menu() {
 usage() {
     cat <<'HELP'
 Usage: sudo bash deploy.sh [--bundle-dir DIR] [COMMAND]
+Shortcut: xb (menu), xb update [--version TAG], xb logs, xb uninstall
   menu (default), install, upgrade, status, check, start, stop, restart,
   logs, backup, restore BACKUP_NAME, bindings, edit, deps, uninstall, purge
 Local bundles must include both binaries, install.sh, deploy.sh and SHA256SUMS.
@@ -446,10 +474,14 @@ main() {
         menu) menu ;;
         install) install_wizard ;;
         upgrade) verify_bundle && with_lock upgrade_local ;;
+        online-upgrade|update) online_upgrade "$@" ;;
         status) show_status ;;
         check) diagnose ;;
         start|stop|restart) with_lock service_action "$command" ;;
-        logs) journalctl -u "$SERVICE" -n 80 --no-pager ;;
+        logs|log)
+            if [[ "${1:-}" == -f || "${1:-}" == --follow ]]; then journalctl -u "$SERVICE" -n 80 -f
+            else journalctl -u "$SERVICE" -n 80 --no-pager; fi
+            ;;
         backup) with_lock snapshot ;;
         restore)
             [[ $# == 1 ]] || { usage; return 1; }

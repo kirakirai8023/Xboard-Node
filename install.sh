@@ -19,7 +19,10 @@ BINARY_PATH="/usr/local/bin/xboard-node"
 SERVICE_NAME="xboard-node.service"
 SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}"
 CLI_PATH="/usr/local/bin/xbctl"
+SHORTCUT_PATH="/usr/local/bin/xb"
 INSTALLER_COPY_PATH="${INSTALL_ROOT}/install.sh"
+INSTALLER_SOURCE_PATH="${BASH_SOURCE[0]:-}"
+DEFAULT_RAW_BASE="https://raw.githubusercontent.com/kirakirai8023/Xboard-Node"
 CLI_BINARY_SOURCE=""
 DEFAULT_HEALTH_PORT=65530
 DEFAULT_KERNEL="singbox"
@@ -128,6 +131,19 @@ rollback_install() {
             install -m 644 "$BACKUP_PATH/${SERVICE_NAME}" "$SERVICE_PATH"
         else
             rm -f "$SERVICE_PATH"
+        fi
+        local helper
+        for helper in install.sh deploy.sh online-install.sh; do
+            if [ -f "$BACKUP_PATH/$helper" ]; then
+                install -m 755 "$BACKUP_PATH/$helper" "$INSTALL_ROOT/$helper"
+            else
+                rm -f -- "$INSTALL_ROOT/$helper"
+            fi
+        done
+        if [ -f "$BACKUP_PATH/xb" ]; then
+            install -m 755 "$BACKUP_PATH/xb" "$SHORTCUT_PATH"
+        else
+            remove_management_shortcut
         fi
     fi
     load_health_port_from_config "$CONFIG_FILE"
@@ -577,6 +593,62 @@ stage_xbctl() {
     fi
 }
 
+management_shortcut_owned() {
+    [[ -f "$SHORTCUT_PATH" && ! -L "$SHORTCUT_PATH" ]] &&
+        grep -Fqx '# Xboard-Node management shortcut' "$SHORTCUT_PATH"
+}
+
+remove_management_shortcut() {
+    if management_shortcut_owned; then rm -f -- "$SHORTCUT_PATH"; fi
+}
+
+stage_management_tools() {
+    if [[ -e "$SHORTCUT_PATH" || -L "$SHORTCUT_PATH" ]] && ! management_shortcut_owned; then
+        log_error "${SHORTCUT_PATH} already exists and is not managed by Xboard-Node"
+        return 1
+    fi
+    local source_dir="" ref="" helper
+    if [[ -f "$INSTALLER_SOURCE_PATH" ]]; then
+        source_dir=$(cd -- "$(dirname -- "$INSTALLER_SOURCE_PATH")" && pwd -P)
+    fi
+    # Installed helpers belong to the previous release, not the staged binaries.
+    if [[ -n "$source_dir" && "$source_dir" -ef "$INSTALL_ROOT" ]]; then
+        source_dir=""
+    fi
+    for helper in install.sh deploy.sh online-install.sh xb; do
+        if [[ -n "$source_dir" && -f "$source_dir/$helper" ]]; then
+            cp -- "$source_dir/$helper" "$TMP_DIR/$helper"
+        else
+            if [[ -z "$ref" ]]; then
+                ref="$RELEASE_VERSION"
+                if [[ "$ref" == latest ]]; then
+                    ref=$("$TMP_DIR/xbctl" version | awk 'NR == 1 { print $2 }')
+                fi
+                [[ "$ref" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$ ]] || {
+                    log_error 'Cannot determine the release source for management tools'
+                    return 1
+                }
+            fi
+            curl -fsSL --retry 3 --connect-timeout 15 --max-time 60 \
+                --proto '=https' --proto-redir '=https' \
+                "$DEFAULT_RAW_BASE/$ref/$helper" -o "$TMP_DIR/$helper" || {
+                log_error "Cannot download $helper for release $ref; use a complete current deployment bundle"
+                return 1
+            }
+        fi
+        bash -n "$TMP_DIR/$helper" || return 1
+    done
+    grep -Fqx '# Xboard-Node management shortcut' "$TMP_DIR/xb" || return 1
+}
+
+install_management_tools() {
+    local helper
+    for helper in install.sh deploy.sh online-install.sh; do
+        install -m 755 "$TMP_DIR/$helper" "$INSTALL_ROOT/$helper"
+    done
+    install -m 755 "$TMP_DIR/xb" "$SHORTCUT_PATH"
+}
+
 render_config() {
     # Do not expose the token in the xbctl process arguments.
     printf '%s' "$TOKEN" > "$TMP_DIR/token"
@@ -659,6 +731,11 @@ backup_existing_state() {
     if [ -x "$CLI_PATH" ]; then
         cp "$CLI_PATH" "$BACKUP_PATH/xbctl"
     fi
+    local helper
+    for helper in install.sh deploy.sh online-install.sh; do
+        if [[ -f "$INSTALL_ROOT/$helper" ]]; then cp -p -- "$INSTALL_ROOT/$helper" "$BACKUP_PATH/$helper"; fi
+    done
+    if management_shortcut_owned; then cp -p -- "$SHORTCUT_PATH" "$BACKUP_PATH/xb"; fi
     if [ -f "$CONFIG_FILE" ]; then
         cp "$CONFIG_FILE" "$BACKUP_PATH/config.yml"
     fi
@@ -688,9 +765,7 @@ install_staged_files() {
     install -m 600 "$TMP_DIR/config.yml" "$CONFIG_FILE"
     install -m 600 "$TMP_DIR/credentials.env" "$CREDENTIALS_FILE"
     install -m 644 "$TMP_DIR/install-meta.json" "$INSTALL_META"
-    if [ -f "$0" ] && [ "$(realpath "$0")" != "$(realpath "$INSTALLER_COPY_PATH" 2>/dev/null || echo "$INSTALLER_COPY_PATH")" ]; then
-        install -m 755 "$0" "$INSTALLER_COPY_PATH"
-    fi
+    install_management_tools
     install -m 755 "$TMP_DIR/xbctl" "$CLI_PATH"
     ln -sf "$CLI_PATH" /usr/bin/xbctl 2>/dev/null || true
     install -m 644 "$TMP_DIR/${SERVICE_NAME}" "$SERVICE_PATH"
@@ -747,6 +822,7 @@ perform_install() {
     ensure_dirs
     stage_binary
     stage_xbctl
+    stage_management_tools
     render_config
     render_service
     backup_existing_state
@@ -763,6 +839,7 @@ perform_install() {
         log_info "Health: http://127.0.0.1:${HEALTH_PORT}/healthz"
     fi
     log_info "CLI: ${CLI_PATH}  (run '${CLI_PATH} list' if xbctl is not in PATH)"
+    log_info "Management menu: xb"
 }
 
 perform_upgrade() {
@@ -777,12 +854,14 @@ perform_upgrade() {
     ensure_dirs
     stage_binary
     stage_xbctl
+    stage_management_tools
     render_service
     backup_existing_state
     MUTATION_STARTED=1
     stop_existing_service
     install -m 755 "$TMP_DIR/xboard-node" "$BINARY_PATH"
     install -m 755 "$TMP_DIR/xbctl" "$CLI_PATH"
+    install_management_tools
     ln -sf "$CLI_PATH" /usr/bin/xbctl 2>/dev/null || true
     install -m 644 "$TMP_DIR/${SERVICE_NAME}" "$SERVICE_PATH"
     systemctl daemon-reload
@@ -818,6 +897,7 @@ perform_uninstall() {
     fi
     rm -f "$BINARY_PATH"
     rm -f "$CLI_PATH"
+    remove_management_shortcut
     rm -f /usr/bin/xbctl 2>/dev/null || true
     if [ "$PURGE" -eq 1 ]; then
         rm -rf "$INSTALL_ROOT"
