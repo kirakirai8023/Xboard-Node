@@ -15,6 +15,14 @@ SERVICE=xboard-node.service
 LOCK_PATH=/run/lock/xboard-node-deploy.lock
 TOKEN_DIR=""
 TOKEN_PATH=""
+CERT_PROFILE_PATH=""
+TOPOLOGY=direct
+CDN_KIND=""
+INSPECTION_FILE=""
+CERT_NEEDED=0
+REPORT_NODES=0
+declare -a LISTENER_PORTS=()
+declare -a LISTENER_PROTOCOLS=()
 BACKUP_LAST=""
 NODE_FILE=""
 CLI_FILE=""
@@ -51,10 +59,10 @@ architecture() {
 }
 cleanup_token() {
     if [[ -n "$TOKEN_DIR" && "$TOKEN_PATH" == "$TOKEN_DIR/token" ]]; then
-        rm -f -- "$TOKEN_PATH"
+        rm -f -- "$TOKEN_PATH" "$TOKEN_DIR/dns-token" "$TOKEN_DIR/certificate.yml" "$TOKEN_DIR/inspection.tsv"
         rmdir -- "$TOKEN_DIR" 2>/dev/null || true
     fi
-    TOKEN_DIR=""; TOKEN_PATH=""
+    TOKEN_DIR=""; TOKEN_PATH=""; CERT_PROFILE_PATH=""; INSPECTION_FILE=""
 }
 read_token() {
     local secret
@@ -258,6 +266,156 @@ read_binding() {
     [[ "$NODE_TYPE" =~ ^[a-z0-9_-]+$ ]] || { fail '协议名称无效。'; return 1; }
     read_token
 }
+installation_state() {
+    if [[ -f "$INSTALL_ROOT/config.yml" && -f "$UNIT_PATH" && -x "$NODE_PATH" && -x "$CLI_PATH" ]]; then
+        printf installed
+    elif [[ -f "$INSTALL_ROOT/config.yml" || -f "$UNIT_PATH" || -e "$NODE_PATH" || -e "$CLI_PATH" ]]; then
+        printf partial
+    else printf fresh; fi
+}
+read_topology() {
+    local choice
+    say '连接方式：1=服务器直连（含 Reality / TLS / UDP 协议）'
+    say '          2=Cloudflare HTTPS 直接回源到核心'
+    say '          3=Cloudflare → Nginx/Caddy → 核心'
+    say '          4=其他 HTTP CDN / Cloudflare 自定义回源端口'
+    say '          5=Nginx/Caddy 反代（不经过 CDN）'
+    ask choice '选择连接方式' 1 || return 1
+    CDN_KIND=""
+    case "$choice" in
+        1) TOPOLOGY=direct ;;
+        2) TOPOLOGY=cloudflare; CDN_KIND=cloudflare ;;
+        3) TOPOLOGY=proxy; CDN_KIND=cloudflare ;;
+        4) TOPOLOGY=cdn; CDN_KIND=custom ;;
+        5) TOPOLOGY=proxy ;;
+        *) fail '连接方式无效。'; return 1 ;;
+    esac
+}
+inspect_binding() {
+    local kind id protocol network tls port listen domain path cert_mode panel_cert needs_cert users rest
+    local -a options=(deploy inspect --panel-url "$PANEL_URL" --token-file "$TOKEN_PATH"
+        --mode "$MODE" --kernel "$KERNEL" --topology "$TOPOLOGY" --output tsv)
+    if [[ "$MODE" == machine ]]; then options+=(--machine-id "$TARGET_ID")
+    else options+=(--node-id "$TARGET_ID" --node-type "$NODE_TYPE"); fi
+    if [[ -f "$INSTALL_ROOT/config.yml" ]]; then
+        options+=(--existing-config "$INSTALL_ROOT/config.yml" --credentials-in "$INSTALL_ROOT/credentials.env")
+    fi
+    INSPECTION_FILE="$TOKEN_DIR/inspection.tsv"
+    say '正在读取面板实际配置和用户列表……'
+    (umask 077; "$CLI_FILE" "${options[@]}" > "$INSPECTION_FILE") || {
+        fail '面板预检未通过。请检查上方原因；XHTTP 应使用 Xray，并清空面板和客户端的 flow。'; return 1;
+    }
+    CERT_NEEDED=0; REPORT_NODES=0; NODE_DOMAIN=""; NODE_NETWORK=""; NODE_PATH_VALUE=""
+    LISTENER_PORTS=(); LISTENER_PROTOCOLS=()
+    while IFS=$'\t' read -r kind id protocol network tls port listen domain path cert_mode panel_cert needs_cert users rest; do
+        case "$kind" in
+            NODES) REPORT_NODES=$id ;;
+            NODE)
+                say "节点 $id：$protocol / $network，TLS=$tls，监听 $listen:$port，用户数=$users"
+                say "  Host/SNI=$domain；路径=$path；证书=$cert_mode；面板管理证书=$panel_cert"
+                LISTENER_PORTS+=("$port"); LISTENER_PROTOCOLS+=("$protocol")
+                if [[ "$needs_cert" == true && "$panel_cert" != true && "$cert_mode" == none ]]; then CERT_NEEDED=$((CERT_NEEDED+1)); fi
+                NODE_DOMAIN=$domain; NODE_NETWORK=$network; NODE_PATH_VALUE=$path
+                ;;
+            WARNING) say "提示：$id" ;;
+        esac
+    done < "$INSPECTION_FILE"
+    [[ "$REPORT_NODES" =~ ^[0-9]+$ ]] || return 1
+    if [[ "$REPORT_NODES" == 0 ]]; then
+        confirm '当前机器没有分配节点，仍安装等待面板后续下发？' || return 1
+    fi
+    if [[ "$MODE" == machine && "$REPORT_NODES" -gt 1 && "$CERT_NEEDED" -gt 0 ]]; then
+        fail '多节点机器需要在面板为每个 TLS 节点设置证书策略（cert_config），以免共用错误域名。设置后重新运行向导。'; return 1
+    fi
+}
+port_listeners() {
+    local port=$1 socket=${2:-tcp}
+    if [[ "$socket" == udp ]]; then ss -H -lunp "sport = :$port"
+    else ss -H -ltnp "sport = :$port"; fi
+}
+check_listener_ports() {
+    need ss || return 1
+    local index socket listeners
+    for index in "${!LISTENER_PORTS[@]}"; do
+        socket=tcp
+        case "${LISTENER_PROTOCOLS[index]}" in hysteria|hysteria2|tuic) socket=udp ;; esac
+        listeners=$(port_listeners "${LISTENER_PORTS[index]}" "$socket") || return 1
+        if [[ -n "$listeners" ]]; then
+            say "端口 ${LISTENER_PORTS[index]}/$socket 已有监听："
+            say "$listeners"
+            confirm '确认这些监听属于将被替换的实例或 V2bX，继续？（向导不会停止 Nginx/Caddy 等其他程序）' || return 1
+        fi
+    done
+}
+read_certificate() {
+    [[ "$CERT_NEEDED" -gt 0 ]] || return 0
+    local choice domain cert_file key_file email secret listeners
+    say '该节点需要本地证书。面板的 cert_config 优先于本地证书设置。'
+    say '证书来源：1=已有 PEM 文件（含 Cloudflare Origin CA），2=Cloudflare DNS 自动申请并续期'
+    say '          3=HTTP 自动申请并续期（公网 80 端口）'
+    ask choice '选择证书来源' 1 || return 1
+    [[ "$NODE_DOMAIN" != - ]] || NODE_DOMAIN=""
+    ask domain '源站证书覆盖的域名（不含 https:// 或路径）' "$NODE_DOMAIN" || return 1
+    local -a options=(deploy cert --domain "$domain" --output "$TOKEN_DIR/certificate.yml")
+    case "$choice" in
+        1)
+            ask cert_file '证书 PEM 的绝对路径' || return 1
+            ask key_file '私钥 PEM 的绝对路径' || return 1
+            [[ "$cert_file" == /* && "$key_file" == /* ]] || { fail '请使用绝对路径，保证服务重启后仍能读取。'; return 1; }
+            options+=(--mode file --cert-file "$cert_file" --key-file "$key_file")
+            ;;
+        2)
+            ask email 'ACME 邮箱（可留空）' || return 1
+            say 'Cloudflare API Token 需要该域名所在 Zone 的 DNS Edit 和 Zone Read 权限。'
+            IFS= read -r -s -p 'Cloudflare API Token（输入隐藏）: ' secret || return 1
+            printf '\n'
+            [[ -n "$secret" && "$secret" != *$'\r'* ]] || return 1
+            (umask 077; printf '%s' "$secret" > "$TOKEN_DIR/dns-token") || return 1
+            unset secret
+            options+=(--mode dns --email "$email" --dns-token-file "$TOKEN_DIR/dns-token")
+            ;;
+        3)
+            listeners=$(port_listeners 80 tcp) || return 1
+            [[ -z "$listeners" ]] || { say "$listeners"; fail '80 端口已被占用，请选 DNS 自动申请或已有证书。'; return 1; }
+            say 'HTTP-01 需要公网 80 端口可达，且 /.well-known/acme-challenge/ 能到达本机；CDN/WAF/反代规则也需放行。'
+            confirm '已确认域名解析、路由和 80 端口可达？' || return 1
+            ask email 'ACME 邮箱（可留空）' || return 1
+            options+=(--mode http --email "$email" --http-port 80)
+            ;;
+        *) fail '证书选项无效。'; return 1 ;;
+    esac
+    "$CLI_FILE" "${options[@]}" || return 1
+    CERT_PROFILE_PATH="$TOKEN_DIR/certificate.yml"
+    say '证书策略已验证；自动申请会在服务启动时进行。DNS Token 仅写入受限配置文件。'
+}
+topology_guidance() {
+    if [[ "$CDN_KIND" == cloudflare ]]; then
+        say 'Cloudflare：域名开启代理（橙云），SSL/TLS 设为 Full (strict)。'
+        say '源站可用公共 CA 或 Cloudflare Origin CA 证书；客户端 Host/SNI 和证书域名需匹配。'
+        say '同一条经 Cloudflare 终止 TLS 的链路使用 TLS，不能同时使用 Reality。'
+    fi
+    if [[ "$TOPOLOGY" != direct ]]; then
+        say '面板与客户端的传输、Host、路径需一致；XHTTP 的 flow 留空，CDN 场景可先使用 packet-up。'
+        say '请给节点路径配置缓存绕过，并检查 WAF/访问挑战规则；gRPC 传输需开启 CDN 的 gRPC 支持。'
+    fi
+    if [[ "$TOPOLOGY" == proxy ]]; then
+        say 'Nginx/Caddy 负责外部 HTTPS；面板应填写核心实际监听的内部端口和 TLS 模式。'
+        say '建议核心监听 127.0.0.1 的独立端口；反代需保留路径、Host 并关闭请求/响应缓冲。'
+        say '向导会保留现有 Nginx/Caddy，请先自行配置对应站点和源站证书。'
+    elif [[ "$CDN_KIND" == custom ]]; then
+        say '请确认 CDN 支持所选 HTTP 传输和回源端口；自定义回源端口需另配 Origin Rule。'
+    fi
+}
+prepare_deployment() {
+    if ! command -v ss >/dev/null 2>&1; then
+        say '需要 iproute2 提供的 ss 来检查端口占用。'
+        need apt-get || return 1
+        confirm '安装缺少的 iproute2 依赖后继续？' || return 1
+        apt-get update && apt-get install -y iproute2 || return 1
+    fi
+    read_topology && inspect_binding && check_listener_ports && read_certificate || return 1
+    topology_guidance
+}
 install_local() {
     local paused="" candidate result=0
     need curl tar flock || return 1
@@ -278,6 +436,7 @@ install_local() {
         --binary "$NODE_FILE" --xbctl-binary "$CLI_FILE" --skip-dependencies)
     if [[ "$MODE" == node ]]; then options+=(--node-id "$TARGET_ID" --node-type "$NODE_TYPE")
     else options+=(--machine-id "$TARGET_ID"); fi
+    if [[ -n "$CERT_PROFILE_PATH" ]]; then options+=(--cert-profile "$CERT_PROFILE_PATH"); fi
     bash "$BUNDLE_DIR/install.sh" "${options[@]}" || result=$?
     if [[ "$result" == 0 ]]; then
         if [[ -n "$paused" ]] && confirm "新服务已启动，是否取消 $paused 的开机自启？"; then systemctl disable "$paused" || return 1; fi
@@ -289,7 +448,14 @@ install_local() {
     return "$result"
 }
 install_wizard() {
-    choose_bundle && read_binding || { cleanup_token; return 1; }
+    if [[ ! -f "$BUNDLE_DIR/SHA256SUMS" && -f "$INSTALL_ROOT/online-install.sh" ]]; then
+        say '管理目录不保存发行包。可以在线下载完整部署包后添加或重新配置实例。'
+        if confirm '在线下载最新正式版并进入部署向导？'; then
+            bash "$INSTALL_ROOT/online-install.sh" install
+            return $?
+        fi
+    fi
+    choose_bundle && read_binding && prepare_deployment || { cleanup_token; return 1; }
     with_lock install_local
     local result=$?
     cleanup_token
@@ -312,7 +478,7 @@ online_upgrade() {
 }
 
 upgrade_local() {
-    [[ -f "$INSTALL_ROOT/config.yml" && -f "$UNIT_PATH" ]] || { fail '请先安装，升级不会创建新配置。'; return 1; }
+    [[ -f "$INSTALL_ROOT/config.yml" ]] || { fail '没有现有配置，请使用首次安装向导。'; return 1; }
     need curl || return 1
     verify_bundle || return 1
     confirm '使用此部署包升级程序并重启？现有配置将保留。' || return 0
@@ -320,14 +486,26 @@ upgrade_local() {
     bash "$BUNDLE_DIR/install.sh" upgrade --binary "$NODE_FILE" --xbctl-binary "$CLI_FILE" --skip-dependencies || return 1
     say '更新完成，输入 xb 可打开管理菜单。'
 }
+upgrade_entry() {
+    if [[ ! -f "$INSTALL_ROOT/config.yml" ]]; then
+        say '未找到现有配置，当前服务器需要首次安装。'
+        confirm '改为进入首次部署向导？' || return 1
+        install_wizard
+    else
+        if [[ "$(installation_state)" == partial ]]; then say '检测到安装不完整，将保留配置并修复程序和服务。'; fi
+        verify_bundle && with_lock upgrade_local
+    fi
+}
 binding_add() {
     [[ -x "$CLI_PATH" ]] || { fail '请先安装。'; return 1; }
-    read_binding || { cleanup_token; return 1; }
+    CLI_FILE="$CLI_PATH"
+    read_binding && prepare_deployment || { cleanup_token; return 1; }
     local action=add-node result
     [[ "$MODE" != machine ]] || action=add-machine
     local -a options=(bind "$action" --panel-url "$PANEL_URL" --token-file "$TOKEN_PATH" --kernel "$KERNEL")
     if [[ "$MODE" == node ]]; then options+=(--node-id "$TARGET_ID" --node-type "$NODE_TYPE")
     else options+=(--machine-id "$TARGET_ID"); fi
+    if [[ -n "$CERT_PROFILE_PATH" ]]; then options+=(--cert-profile "$CERT_PROFILE_PATH"); fi
     snapshot && "$CLI_PATH" "${options[@]}"
     result=$?
     cleanup_token
@@ -379,8 +557,8 @@ edit_config() {
 }
 dependencies() {
     need apt-get || return 1
-    confirm '通过 apt 安装 curl、CA 证书、util-linux 和 unzip？' || return 0
-    apt-get update && apt-get install -y curl ca-certificates util-linux unzip
+    confirm '通过 apt 安装 curl、CA 证书、util-linux、unzip 和 iproute2？' || return 0
+    apt-get update && apt-get install -y curl ca-certificates util-linux unzip iproute2
 }
 diagnose() {
     show_status
@@ -388,6 +566,13 @@ diagnose() {
     if [[ -f "$INSTALL_ROOT/config.yml" ]]; then stat -c '配置权限：%a %n' "$INSTALL_ROOT/config.yml"; fi
     say '默认转发 auto；周期计费可切换 compatible。嗅探默认为 off。'
     say '程序运行不代表面板认证和代理流量已验证，请同时检查面板在线状态。'
+}
+panel_diagnose() {
+    [[ -x "$CLI_PATH" && -f "$INSTALL_ROOT/config.yml" ]] || { fail '请先安装实例。'; return 1; }
+    read_topology || return 1
+    "$CLI_PATH" deploy inspect --config "$INSTALL_ROOT/config.yml" --credentials-in "$INSTALL_ROOT/credentials.env" --topology "$TOPOLOGY" || return 1
+    topology_guidance
+    say '预检验证配置与面板认证；公网 CDN、TLS 握手和真实代理流量仍需用客户端测试。'
 }
 uninstall_local() {
     local purge=${1:-0} installer="$INSTALL_ROOT/install.sh"
@@ -408,6 +593,7 @@ menu() {
     local choice log_choice
     while true; do
         printf '\n%s\n' '========== Xboard-Node 部署管理 =========='
+        say "安装状态：$(installation_state)；配置目录：$INSTALL_ROOT"
         say ' 1. 本地安装 / 部署向导（节点或机器模式）'
         say ' 2. 在线更新至最新正式版（保留配置）'
         say ' 3. 查看状态 / 版本 / 实例'
@@ -416,6 +602,7 @@ menu() {
         say '10. 创建备份     11. 恢复备份     12. 环境诊断'
         say '13. 安装依赖     14. 卸载保留配置 15. 完整卸载'
         say '16. 开机自启     17. 取消自启     18. 本地包升级'
+        say '19. 面板 / TLS / CDN 配置预检'
         say ' 0. 退出'
         read -r -p '请选择: ' choice || return 0
         case "$choice" in
@@ -441,7 +628,8 @@ menu() {
             15) with_lock uninstall_local 1 || true ;;
             16) with_lock service_action enable || true ;;
             17) with_lock service_action disable || true ;;
-            18) choose_bundle && with_lock upgrade_local || say '升级未完成，请检查上方信息。' ;;
+            18) choose_bundle && upgrade_entry || say '升级未完成，请检查上方信息。' ;;
+            19) panel_diagnose || say '预检未通过，请检查上方信息。' ;;
             *) say '请选择菜单中的编号。' ;;
         esac
     done
@@ -451,7 +639,7 @@ usage() {
 Usage: sudo bash deploy.sh [--bundle-dir DIR] [COMMAND]
 Shortcut: xb (menu), xb update [--version TAG], xb logs, xb uninstall
   menu (default), install, upgrade, status, check, start, stop, restart,
-  logs, backup, restore BACKUP_NAME, bindings, edit, deps, uninstall, purge
+  logs, backup, restore BACKUP_NAME, bindings, edit, deps, preflight, uninstall, purge
 Local bundles must include both binaries, install.sh, deploy.sh and SHA256SUMS.
 Snapshots are retained under /var/backups/xboard-node, including after purge.
 HELP
@@ -473,10 +661,11 @@ main() {
     case "$command" in
         menu) menu ;;
         install) install_wizard ;;
-        upgrade) verify_bundle && with_lock upgrade_local ;;
+        upgrade) upgrade_entry ;;
         online-upgrade|update) online_upgrade "$@" ;;
         status) show_status ;;
         check) diagnose ;;
+        preflight) panel_diagnose ;;
         start|stop|restart) with_lock service_action "$command" ;;
         logs|log)
             if [[ "${1:-}" == -f || "${1:-}" == --follow ]]; then journalctl -u "$SERVICE" -n 80 -f

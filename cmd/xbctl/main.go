@@ -192,6 +192,8 @@ func run(args []string) error {
 		return nil
 	case "config":
 		return runConfig(args[1:])
+	case "deploy":
+		return runDeployment(args[1:])
 	case "help", "-h", "--help":
 		printUsage()
 		return nil
@@ -209,6 +211,8 @@ func printUsage() {
   xbctl instance get <id> [--output text|json]
   xbctl config init --mode node|machine --panel-url URL (--token TOKEN | --token-file PATH) [flags]
   xbctl config health-port [--config PATH]
+  xbctl deploy inspect --config PATH [--credentials-in PATH] [--topology cloudflare|proxy|direct] [--output text|json|tsv]
+  xbctl deploy cert --mode file|dns|http|self|none --domain DOMAIN --output PATH [flags]
   xbctl service status|start|stop|restart|enable|disable|logs
   xbctl health
   xbctl bind add-node --panel-url URL --token TOKEN --node-id ID [--node-type TYPE] [--kernel singbox|xray]
@@ -1264,13 +1268,14 @@ func runConfigInit(args []string) error {
 		installRoot    string
 		token          string
 		tokenFile      string
+		certProfile    string
 		releaseVersion string
 	)
 
 	for i := 0; i < len(args); i++ {
 		if i+1 >= len(args) {
-			if args[i] == "--token-file" {
-				return errors.New("--token-file requires a file path")
+			if args[i] == "--token-file" || args[i] == "--cert-profile" {
+				return fmt.Errorf("%s requires a file path", args[i])
 			}
 			break
 		}
@@ -1342,6 +1347,9 @@ func runConfigInit(args []string) error {
 		case "--token-file":
 			i++
 			tokenFile = args[i]
+		case "--cert-profile":
+			i++
+			certProfile = args[i]
 		case "--version":
 			i++
 			releaseVersion = args[i]
@@ -1363,6 +1371,14 @@ func runConfigInit(args []string) error {
 	}
 	if mode == "" {
 		return errors.New("--mode is required (node or machine)")
+	}
+	var certificate *config.CertConfig
+	if certProfile != "" {
+		var err error
+		certificate, err = readDeploymentCert(certProfile)
+		if err != nil {
+			return err
+		}
 	}
 	if panelURL == "" {
 		return errors.New("--panel-url is required")
@@ -1392,6 +1408,9 @@ func runConfigInit(args []string) error {
 		if nodeType != "" {
 			inst.Panel.NodeType = nodeType
 		}
+	}
+	if certificate != nil {
+		inst.Cert = *certificate
 	}
 
 	// Generate deterministic instance ID.
@@ -1460,6 +1479,9 @@ func runConfigInit(args []string) error {
 	replaced := false
 	for i, existing := range instances {
 		if existing.InstanceID == instanceID {
+			if certificate == nil {
+				inst.Cert = existing.Cert
+			}
 			instances[i] = inst
 			replaced = true
 			break
