@@ -17,7 +17,7 @@ error() { printf '错误：%s\n' "$*" >&2; return 1; }
 usage() {
     cat <<'HELP'
 Usage: sudo bash online-install.sh [--version TAG] [menu|install|upgrade]
-Downloads a matching Windows-built deployment ZIP from GitHub Releases,
+Downloads a matching deployment ZIP from GitHub Releases,
 verifies it and opens the deployment menu. Default version: latest.
 Supports Debian/Ubuntu with systemd, Linux amd64 and arm64.
 Each release needs xboard-node-TAG-linux-ARCH.zip and its .zip.sha256 file.
@@ -101,7 +101,7 @@ download_bundle() {
     local asset="$PACKAGE_NAME.zip" line hash base="https://github.com/$REPOSITORY/releases/download/$VERSION"
     printf '下载版本：%s；服务器架构：%s\n' "$VERSION" "$ARCH"
     download_file "$base/$asset.sha256" "$WORK_DIR/$asset.sha256" || {
-        error "缺少发布附件 $asset.sha256，请上传 build.bat 生成的 ZIP 和校验文件。"; return 1;
+        error "缺少发布附件 $asset.sha256，请先发布完整部署包及校验文件。"; return 1;
     }
     line=$(<"$WORK_DIR/$asset.sha256")
     line=${line%$'\r'}

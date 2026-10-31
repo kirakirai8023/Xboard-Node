@@ -6,14 +6,86 @@ on:
     tags: ["v*"]
   pull_request:
     branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version, for example v1.0.1 or v1.0.1-rc.1'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ inputs.version || github.ref }}
+  cancel-in-progress: false
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  prepare:
+    name: Prepare version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release_tag: ${{ steps.version.outputs.release_tag }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      latest: ${{ steps.version.outputs.latest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Resolve and validate release version
+        id: version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          release_tag=''
+          prerelease=false
+          latest=false
+          if [[ "$EVENT_NAME" == workflow_dispatch ]]; then
+            if [[ -z "$INPUT_VERSION" ]]; then
+              echo '::error::A release version is required for a manual run.'
+              exit 1
+            fi
+            release_tag="$INPUT_VERSION"
+          elif [[ "$REF_TYPE" == tag ]]; then
+            release_tag="$REF_NAME"
+          elif [[ "$EVENT_NAME" == push && "$REF_NAME" == dev ]]; then
+            release_tag=dev
+          fi
+          if [[ -n "$release_tag" && "$release_tag" != dev ]]; then
+            if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ || ${#release_tag} -gt 64 ]]; then
+              echo '::error::Use a version such as v1.0.1 or v1.0.1-rc.1 (at most 64 characters).'
+              exit 1
+            fi
+            if git show-ref --verify --quiet "refs/tags/$release_tag"; then
+              tagged_commit=$(git rev-parse "refs/tags/$release_tag^{commit}")
+              if [[ "$tagged_commit" != "$GITHUB_SHA" ]]; then
+                echo '::error::This tag belongs to another commit. Select that tag or use a new version.'
+                exit 1
+              fi
+            fi
+          fi
+          version="${release_tag:-$GITHUB_SHA}"
+          if [[ "$release_tag" == dev || "$release_tag" == *-* ]]; then
+            prerelease=true
+          elif [[ -n "$release_tag" ]]; then
+            latest=true
+          fi
+          printf 'version=%s\nrelease_tag=%s\nprerelease=%s\nlatest=%s\n' \
+            "$version" "$release_tag" "$prerelease" "$latest" >> "$GITHUB_OUTPUT"
+
   test:
     name: Test
     runs-on: ubuntu-latest
+    needs: prepare
     steps:
       - uses: actions/checkout@v4
 
@@ -24,7 +96,15 @@ jobs:
           cache: true
 
       - name: Run tests
-        run: make test
+        run: |
+          make test
+          go test -v -race -count=1 ./cmd/...
+
+      - name: Check installation script syntax
+        run: |
+          for file in install.sh deploy.sh online-install.sh; do
+            bash -n "$file"
+          done
 
       - name: Run isolated kernel integration tests
         run: make test-integration
@@ -32,7 +112,7 @@ jobs:
   build:
     name: Build
     runs-on: ubuntu-latest
-    needs: test
+    needs: [prepare, test]
     strategy:
       matrix:
         include:
@@ -51,7 +131,7 @@ jobs:
 
       - name: Build
         env:
-          VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || github.sha }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           if [ "${{ matrix.goarch }}" = "amd64" ]; then
             make build-linux
@@ -59,17 +139,68 @@ jobs:
             make build-linux-arm64
           fi
 
-      - name: Upload xboard-node artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: xboard-node-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: xboard-node-${{ matrix.goos }}-${{ matrix.goarch }}
+      - name: Package deployment bundle and checksums
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TARGET_ARCH: ${{ matrix.goarch }}
+        run: |
+          python3 - <<'PY'
+          import datetime
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import shutil
+          import subprocess
+          import zipfile
 
-      - name: Upload xbctl artifact
+          version = os.environ["VERSION"]
+          arch = os.environ["TARGET_ARCH"]
+          name = f"xboard-node-{version}-linux-{arch}"
+          output = pathlib.Path("dist")
+          output.mkdir(exist_ok=True)
+          package = pathlib.Path(os.environ["RUNNER_TEMP"]) / name
+          package.mkdir()
+          for binary in ("xboard-node", "xbctl"):
+              source = pathlib.Path(f"{binary}-linux-{arch}")
+              shutil.copy2(source, package / binary)
+              shutil.copy2(source, output / source.name)
+          for name_in in ("install.sh", "deploy.sh", "online-install.sh", "config.yml.example", "LICENSE.md"):
+              text = pathlib.Path(name_in).read_text(encoding="utf-8-sig")
+              (package / name_in).write_text(text, encoding="utf-8", newline="\n")
+          for script in package.glob("*.sh"):
+              script.chmod(0o755)
+          shutil.copytree("LICENSES", package / "LICENSES")
+          metadata = {
+              "version": version, "os": "linux", "arch": arch,
+              "go_version": subprocess.check_output(["go", "env", "GOVERSION"], text=True).strip(),
+              "revision": os.environ["GITHUB_SHA"],
+              "built_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "tags": "with_quic with_utls with_wireguard with_acme with_clash_api",
+              "tests_skipped": False,
+          }
+          (package / "BUILD-INFO.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8", newline="\n")
+          manifest = []
+          for file in sorted(package.rglob("*")):
+              if file.is_file():
+                  digest = hashlib.sha256(file.read_bytes()).hexdigest()
+                  manifest.append(f"{digest}  {file.relative_to(package).as_posix()}\n")
+          (package / "SHA256SUMS").write_text("".join(manifest), encoding="utf-8", newline="\n")
+          archive_path = output / f"{name}.zip"
+          with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+              for file in sorted(package.rglob("*")):
+                  if file.is_file():
+                      archive.write(file, f"{name}/{file.relative_to(package).as_posix()}")
+          digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+          (output / f"{name}.zip.sha256").write_text(f"{digest}  {name}.zip\n", encoding="utf-8", newline="\n")
+          PY
+
+      - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: xbctl-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: xbctl-${{ matrix.goos }}-${{ matrix.goarch }}
+          name: release-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/
+          if-no-files-found: error
 
   build-docker:
     name: Build & Push Docker Image
@@ -115,8 +246,8 @@ jobs:
   release:
     name: Release
     runs-on: ubuntu-latest
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/dev'
+    needs: [prepare, build]
+    if: needs.prepare.outputs.release_tag != ''
     permissions:
       contents: write
     steps:
@@ -124,6 +255,7 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: release-linux-*
           merge-multiple: true
           path: dist
       - name: Package project license notices
@@ -131,9 +263,18 @@ jobs:
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'dev' }}
-          make_latest: ${{ startsWith(github.ref, 'refs/tags/') }}
+          tag_name: ${{ needs.prepare.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          name: Xboard-Node ${{ needs.prepare.outputs.release_tag }}
+          prerelease: ${{ needs.prepare.outputs.prerelease }}
+          make_latest: ${{ needs.prepare.outputs.latest }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
           files: |
+            dist/xboard-node-*-linux-amd64.zip
+            dist/xboard-node-*-linux-amd64.zip.sha256
+            dist/xboard-node-*-linux-arm64.zip
+            dist/xboard-node-*-linux-arm64.zip.sha256
             dist/xboard-node-linux-amd64
             dist/xboard-node-linux-arm64
             dist/xbctl-linux-amd64
