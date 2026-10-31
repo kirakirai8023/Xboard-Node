@@ -197,6 +197,7 @@ usage() {
   ACTIONS:
     install      Install or reconcile the configured deployment (default)
     upgrade      Upgrade binary and restart service
+    repair       Recreate the systemd unit and start existing binaries/config
     uninstall    Remove installed service and binary (config kept unless --purge)
     status       Show current installation status
     help         Show this help
@@ -244,7 +245,7 @@ parse_args() {
     local positional=()
     while [ $# -gt 0 ]; do
         case "$1" in
-            install|upgrade|uninstall|status|help)
+            install|upgrade|repair|uninstall|status|help)
                 ACTION="$1"
                 shift
                 ;;
@@ -882,6 +883,43 @@ perform_upgrade() {
     log_info "Upgrade succeeded"
 }
 
+perform_repair() {
+    if [[ ! -f "$CONFIG_FILE" || ! -x "$BINARY_PATH" ]]; then
+        log_error "Repair requires an existing config and executable; run install or upgrade first"
+        return 1
+    fi
+    local unit_state
+    unit_state=$(systemctl show --property=LoadState --value "$SERVICE_NAME" 2>/dev/null) || true
+    if [[ "$unit_state" == masked || -L "$SERVICE_PATH" ]]; then
+        log_error "Refusing to replace a masked or symlinked service; inspect the existing unit first"
+        return 1
+    fi
+    # This path never downloads or replaces binaries, credentials or config.
+    HEALTH_PORT=0
+    HEALTH_ENABLED=0
+    load_health_port_from_config "$CONFIG_FILE"
+    if [[ "$HEALTH_ENABLED" == 1 ]] && ! command -v curl >/dev/null 2>&1; then
+        log_error "curl is required to check the configured health endpoint"
+        return 1
+    fi
+    TMP_DIR=$(mktemp -d)
+    ensure_dirs
+    render_service
+    backup_existing_state
+    MUTATION_STARTED=1
+    install -m 644 "$TMP_DIR/${SERVICE_NAME}" "$SERVICE_PATH"
+    systemctl daemon-reload
+    systemctl reset-failed "$SERVICE_NAME" >/dev/null 2>&1 || true
+    systemctl start "$SERVICE_NAME"
+    if ! wait_for_health; then
+        log_error "Service unit restored, but startup failed; inspect the daemon logs"
+        show_recent_logs
+        return 1
+    fi
+    MUTATION_STARTED=0
+    log_info "Service repaired and started; config, binaries and boot-enable policy preserved"
+}
+
 confirm_uninstall() {
     if [ "$YES" -eq 1 ]; then
         return
@@ -956,6 +994,11 @@ main() {
     esac
 
     check_root
+    if [[ "$ACTION" == repair ]]; then
+        ensure_systemd
+        perform_repair
+        return
+    fi
     detect_arch
     detect_os
     ensure_systemd

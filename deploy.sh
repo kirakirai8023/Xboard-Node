@@ -542,8 +542,43 @@ show_status() {
 service_action() {
     local action=$1
     case "$action" in start|stop|restart|enable|disable) ;; *) return 1 ;; esac
+    if ! service_unit_ready; then
+        if [[ "$UNIT_LOAD_STATE" == masked ]]; then
+            fail '服务被 systemd 屏蔽（masked），请先检查屏蔽原因。'; return 1
+        fi
+        if [[ "$action" == stop || "$action" == disable ]]; then
+            fail '服务尚未注册，无需执行此操作。'; return 1
+        fi
+        repair_service_unit || return 1
+        if [[ "$action" == start || "$action" == restart ]]; then return 0; fi
+    fi
     if [[ "$action" == stop || "$action" == restart ]]; then confirm '这会中断当前节点连接，继续？' || return 0; fi
     systemctl "$action" "$SERVICE"
+}
+service_unit_ready() {
+    UNIT_LOAD_STATE=$(systemctl show --property=LoadState --value "$SERVICE" 2>/dev/null) || true
+    if [[ "$UNIT_LOAD_STATE" != loaded && "$UNIT_LOAD_STATE" != masked && -f "$UNIT_PATH" && ! -L "$UNIT_PATH" ]]; then
+        systemctl daemon-reload || return 1
+        UNIT_LOAD_STATE=$(systemctl show --property=LoadState --value "$SERVICE" 2>/dev/null) || true
+    fi
+    [[ "$UNIT_LOAD_STATE" == loaded ]]
+}
+repair_service_unit() {
+    local candidate installer=""
+    [[ -f "$INSTALL_ROOT/config.yml" && -x "$NODE_PATH" ]] || {
+        fail '程序或配置缺失，请使用菜单 1 完成安装；已有配置也可以通过菜单 2 在线升级修复。'; return 1;
+    }
+    for candidate in "$BUNDLE_DIR/install.sh" "$INSTALL_ROOT/install.sh"; do
+        if [[ -f "$candidate" ]] && bash "$candidate" help | grep -Eq '^[[:space:]]+repair[[:space:]]'; then
+            installer=$candidate; break
+        fi
+    done
+    [[ -n "$installer" ]] || { fail '当前安装器不支持服务修复，请先通过在线升级获取新版管理脚本。'; return 1; }
+    say '将重建 xboard-node.service 并启动现有程序，保留配置、密钥和开机自启设置。'
+    confirm '修复服务并启动？' || return 1
+    snapshot || return 1
+    bash "$installer" repair --skip-dependencies || return 1
+    say '服务修复完成。可以使用菜单 3 查看状态，菜单 7 查看日志。'
 }
 edit_config() {
     [[ -f "$INSTALL_ROOT/config.yml" ]] || { fail '配置尚不存在。'; return 1; }
@@ -603,6 +638,7 @@ menu() {
         say '13. 安装依赖     14. 卸载保留配置 15. 完整卸载'
         say '16. 开机自启     17. 取消自启     18. 本地包升级'
         say '19. 面板 / TLS / CDN 配置预检'
+        say '20. 修复服务注册并启动（保留配置和程序）'
         say ' 0. 退出'
         read -r -p '请选择: ' choice || return 0
         case "$choice" in
@@ -630,6 +666,7 @@ menu() {
             17) with_lock service_action disable || true ;;
             18) choose_bundle && upgrade_entry || say '升级未完成，请检查上方信息。' ;;
             19) panel_diagnose || say '预检未通过，请检查上方信息。' ;;
+            20) with_lock repair_service_unit || say '修复未完成，请检查上方信息。' ;;
             *) say '请选择菜单中的编号。' ;;
         esac
     done
@@ -639,7 +676,7 @@ usage() {
 Usage: sudo bash deploy.sh [--bundle-dir DIR] [COMMAND]
 Shortcut: xb (menu), xb update [--version TAG], xb logs, xb uninstall
   menu (default), install, upgrade, status, check, start, stop, restart,
-  logs, backup, restore BACKUP_NAME, bindings, edit, deps, preflight, uninstall, purge
+  logs, backup, restore BACKUP_NAME, bindings, edit, deps, preflight, repair, uninstall, purge
 Local bundles must include both binaries, install.sh, deploy.sh and SHA256SUMS.
 Snapshots are retained under /var/backups/xboard-node, including after purge.
 HELP
@@ -666,6 +703,7 @@ main() {
         status) show_status ;;
         check) diagnose ;;
         preflight) panel_diagnose ;;
+        repair) with_lock repair_service_unit ;;
         start|stop|restart) with_lock service_action "$command" ;;
         logs|log)
             if [[ "${1:-}" == -f || "${1:-}" == --follow ]]; then journalctl -u "$SERVICE" -n 80 -f
