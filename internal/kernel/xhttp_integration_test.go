@@ -37,8 +37,11 @@ import (
 // This exercises the CDN topology locally, without a public CDN or credentials.
 func TestXray_XHTTPThroughCDN(t *testing.T) {
 	for _, originTLS := range []bool{false, true} {
-		for _, mode := range []string{"packet-up", "stream-up"} {
-			t.Run(strconv.FormatBool(originTLS)+"/"+mode, func(t *testing.T) {
+		for _, upload := range []struct{ mode, method string }{
+			{"packet-up", "POST"}, {"packet-up", "OPTIONS"}, {"stream-up", "POST"},
+		} {
+			t.Run(strconv.FormatBool(originTLS)+"/"+upload.mode+"/"+upload.method, func(t *testing.T) {
+				mode := upload.mode
 				payload := bytes.Repeat([]byte("xhttp-upload-and-download\n"), 4096)
 				target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					data, err := io.ReadAll(r.Body)
@@ -59,7 +62,10 @@ func TestXray_XHTTPThroughCDN(t *testing.T) {
 				user := model.UserSpec{ID: 1, UUID: "11111111-1111-1111-1111-111111111111"}
 				newNode := func() *model.NodeSpec {
 					return &model.NodeSpec{Protocol: "vless", ListenIP: "127.0.0.1", Network: "xhttp",
-						NetworkSettings:  map[string]any{"path": "/transport", "host": "cdn.example", "mode": "auto", "extra": map[string]any{"headers": []any{}, "xmux": []any{}}},
+						NetworkSettings: map[string]any{"path": "/transport", "host": "cdn.example", "mode": "auto", "extra": map[string]any{
+							"headers": []any{}, "xmux": []any{}, "uplinkHTTPMethod": upload.method,
+							"h2Params": map[string]any{"MaxConcurrentStreams": 128},
+						}},
 						CustomRouteRules: []model.CustomRouteRule{{Match: model.RouteMatch{IPCIDRs: []string{"127.0.0.1/32"}}, Action: model.RouteAction{Type: "direct"}}}}
 				}
 				node := newNode()
@@ -97,11 +103,15 @@ func TestXray_XHTTPThroughCDN(t *testing.T) {
 					reverse.Transport = h2cTransport
 				}
 				var requests atomic.Int32
+				var uploads atomic.Int32
 				cdn := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					if r.TLS == nil || r.Host != "cdn.example" {
 						t.Error("CDN did not receive the expected HTTPS host")
 					}
 					requests.Add(1)
+					if r.Method == upload.method {
+						uploads.Add(1)
+					}
 					reverse.ServeHTTP(w, r)
 				}))
 				cdn.EnableHTTP2 = true
@@ -118,7 +128,8 @@ func TestXray_XHTTPThroughCDN(t *testing.T) {
 						{"address": "127.0.0.1", "port": cdnPort, "users": []map[string]any{{"id": user.UUID, "encryption": "none"}}},
 					}}, "streamSettings": map[string]any{
 						"network": "xhttp", "security": "tls", "tlsSettings": map[string]any{"pinnedPeerCertSha256": hex.EncodeToString(cdnFingerprint[:]), "serverName": "cdn.example", "alpn": []string{"h2"}},
-						"xhttpSettings": map[string]any{"path": "/transport", "host": "cdn.example", "mode": mode},
+						"xhttpSettings": map[string]any{"path": "/transport", "host": "cdn.example", "mode": mode,
+							"extra": map[string]any{"uplinkHTTPMethod": upload.method}},
 					}}},
 				}
 				data, _ := json.Marshal(clientConfig)
@@ -164,6 +175,9 @@ func TestXray_XHTTPThroughCDN(t *testing.T) {
 				transfer()
 				if requests.Load() == 0 {
 					t.Fatal("traffic bypassed the simulated CDN")
+				}
+				if uploads.Load() == 0 {
+					t.Fatalf("CDN did not receive %s uploads", upload.method)
 				}
 				awaitTraffic(t, server, func(traffic map[int][2]int64) bool {
 					return traffic[1][0] >= int64(len(payload))*2 && traffic[1][1] >= int64(len(payload))*2

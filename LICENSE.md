@@ -43,4 +43,4 @@ Source for this fork is available at [kirakirai8023/Xboard-Node](https://github.
 
 The license texts are reproduced verbatim from the [SPDX License List](https://spdx.org/licenses/).
 
-Dependencies retain their own licenses. In particular, [sing-box v1.14.4](https://github.com/SagerNet/sing-box/blob/v1.14.4/LICENSE) uses GPL-3.0-or-later, and [Xray](https://github.com/XTLS/Xray-core/blob/0afec66085a85191e9dd2a4a6646c7c9a94688d1/LICENSE) uses MPL-2.0. This file does not replace third-party license terms or the copyright notices required for distributions that include those dependencies.
+Dependencies retain their own licenses. In particular, [sing-box v1.14.4](https://github.com/SagerNet/sing-box/blob/v1.14.4/LICENSE) uses GPL-3.0-or-later, and [Xray v26.10.31](https://github.com/XTLS/Xray-core/blob/a4a3dff5b20c2faae567b742c172c7b95e75c083/LICENSE) uses MPL-2.0. This file does not replace third-party license terms or the copyright notices required for distributions that include those dependencies.

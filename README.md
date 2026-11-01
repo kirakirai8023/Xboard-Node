@@ -97,13 +97,13 @@ Use **Go 1.27.3**, matching `go.mod`, CI, and Docker builds and incorporating th
 ```bash
 make build             # Build xboard-node and xbctl
 make test              # Run internal package tests with the race detector
-make test-integration  # Run SOCKS/VLESS traffic tests in an isolated environment
+make test-integration  # Run traffic and Linux listener safety tests in isolation
 make build-all         # Cross-compile for Linux amd64 and arm64
 ```
 
 Traffic integration tests use the `integration` build tag and run in a separate CI step. Use an isolated host without Xray/TUN interception. Tests allow Xray private-network egress only to the local test target. Regular `make test` runs do not start these proxy listeners.
 
-Dependencies pin official sing-box `v1.14.4` and Xray release commit `0afec66085a85191e9dd2a4a6646c7c9a94688d1`. Go resolves Xray to `v1.260327.1-0.20261029083850-0afec66085a8`; the prefix follows Go module versioning rules. Neither kernel uses a fork replacement.
+Dependencies pin official sing-box `v1.14.4` and [Xray v26.10.31](https://github.com/XTLS/Xray-core/releases/tag/v26.10.31), release commit `a4a3dff5b20c2faae567b742c172c7b95e75c083`. Go resolves Xray to `v1.260327.1-0.20261031132019-a4a3dff5b20c`; the prefix follows Go module versioning rules. Neither kernel uses a fork replacement.
 
 Security dependency minimums are `github.com/go-jose/go-jose/v4 v4.1.6` (RSA JWK denial of service, JSON parsing crashes, and CBC-HMAC panics) and `github.com/cilium/ebpf v0.22.0` (integer overflow when parsing BTF metadata). Preserve these minimums when updating transitive dependencies; see [CHANGELOG.md](CHANGELOG.md) for the security advisories.
 

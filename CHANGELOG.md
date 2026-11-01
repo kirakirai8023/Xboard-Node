@@ -4,6 +4,7 @@
 
 ### Security
 
+- Upgrade the official Xray kernel from v26.10.29 to [v26.10.31](https://github.com/XTLS/Xray-core/releases/tag/v26.10.31), which disables MPTCP listeners by default to reduce exposure to the Linux kernel vulnerability described in the upstream release notes. Explicit custom `tcpMptcp: true` settings still opt in; affected hosts also need a patched Linux kernel.
 - Upgrade `github.com/go-jose/go-jose/v4` from v4.1.4 to v4.1.6 to fix RSA JWK parsing denial of service ([GHSA-mgcc-cww5-fp2q](https://github.com/go-jose/go-jose/security/advisories/GHSA-mgcc-cww5-fp2q)), deeply nested JSON parsing crashes ([GHSA-vvm8-gf78-28g4](https://github.com/go-jose/go-jose/security/advisories/GHSA-vvm8-gf78-28g4)), and CBC-HMAC processing panics ([GHSA-4w3g-jfj2-cw2q](https://github.com/go-jose/go-jose/security/advisories/GHSA-4w3g-jfj2-cw2q)).
 - Upgrade `github.com/cilium/ebpf` from v0.21.0 to v0.22.0 to fix integer overflow in BTF parsing through `LoadCollectionSpecFromReader` ([GHSA-xhgw-qwwf-pg32](https://github.com/advisories/GHSA-xhgw-qwwf-pg32), CVE-2026-10722).
 
@@ -20,7 +21,7 @@
 - Derive GHCR publishing tags from the lowercase repository name and use the fork's container image in deployment examples.
 - Document the fork-only contribution workflow and the release publishing requirements for install and upgrade commands.
 - Update direct and transitive dependencies and remove the sing-box and Xray fork replacements.
-- Use official sing-box v1.14.4 and pin Xray v26.10.29 to release commit `0afec66085a85191e9dd2a4a6646c7c9a94688d1` through a Go pseudo-version.
+- Use official sing-box v1.14.4 and pin Xray v26.10.31 to release commit `a4a3dff5b20c2faae567b742c172c7b95e75c083` (`v1.260327.1-0.20261031132019-a4a3dff5b20c`), with refreshed module checksums and the dependency license link.
 - Adapt the sing-box lifecycle to upstream APIs: rebuild instances for credential or configuration changes, preserve cumulative traffic counters, keep connections open for limit-only updates, and attempt to restore the previous configuration if startup fails.
 - Move Xray per-user rate limiting into the local dispatcher, sharing token buckets across each user's connections and preserving the concrete pipe reader types required by mux/XUDP.
 - Remove Mieru from the advertised sing-box inbound and outbound protocol lists.
@@ -31,6 +32,8 @@
 
 ### Added
 
+- Add Chinese and English Xray upgrade notes, verify that XHTTP OPTIONS uploads and `h2Params` survive configuration conversion without changing the panel snapshot, and exercise POST/OPTIONS uploads through a local CDN proxy with HTTP and HTTPS origins.
+- Add a Linux integration regression that checks the listener's socket protocol with and without socket options, even when Go's MPTCP default is enabled; include it in `make test-integration` and the existing CI integration step.
 - Add full MPL-2.0 and AGPL-3.0 license texts, SPDX source headers, and a licensing overview that identifies the initial AGPL-only files.
 - Include project license notices in release assets and container images.
 - Include a Compose file with the source on main so deployment uses the fork's image without relying on the legacy `compose` branch.

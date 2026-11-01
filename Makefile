@@ -28,7 +28,7 @@ test:
 
 # Run proxy listeners and real traffic only in an isolated environment.
 test-integration:
-	go test -v -race -count=1 -tags integration ./internal/kernel
+	go test -v -race -count=1 -tags integration ./internal/kernel ./internal/kernel/xray
 
 # Clean build artifacts
 clean:

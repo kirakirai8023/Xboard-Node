@@ -15,7 +15,9 @@ import (
 	"github.com/kirakirai8023/Xboard-Node/internal/kernel"
 	"github.com/kirakirai8023/Xboard-Node/internal/model"
 	"github.com/kirakirai8023/Xboard-Node/internal/panel"
+	"github.com/xtls/xray-core/app/proxyman"
 	"github.com/xtls/xray-core/infra/conf/serial"
+	"github.com/xtls/xray-core/transport/internet/splithttp"
 )
 
 func TestBuildConfig_XHTTPPreservesSourceAndHash(t *testing.T) {
@@ -25,6 +27,7 @@ func TestBuildConfig_XHTTPPreservesSourceAndHash(t *testing.T) {
 				Protocol: "vless", ListenIP: "127.0.0.1", ServerPort: 12345, Network: network,
 				NetworkSettings: M{"path": "/transport", "mode": "auto", "extra": M{
 					"headers": []any{}, "xmux": []any{},
+					"uplinkHTTPMethod": "OPTIONS", "h2Params": M{"MaxConcurrentStreams": 128},
 					"downloadSettings": M{"network": "xhttp", "sockopt": []any{}, "xhttpSettings": M{"path": "/download"}},
 				}},
 			}
@@ -42,8 +45,25 @@ func TestBuildConfig_XHTTPPreservesSourceAndHash(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := serial.LoadJSONConfig(bytes.NewReader(data)); err != nil {
+			pb, err := serial.LoadJSONConfig(bytes.NewReader(data))
+			if err != nil {
 				t.Fatalf("normalized XHTTP configuration was rejected by Xray: %v", err)
+			}
+			receiver, err := pb.Inbound[0].ReceiverSettings.GetInstance()
+			if err != nil {
+				t.Fatal(err)
+			}
+			transport, err := receiver.(*proxyman.ReceiverConfig).StreamSettings.TransportSettings[0].Settings.GetInstance()
+			if err != nil {
+				t.Fatal(err)
+			}
+			xhttp := transport.(*splithttp.Config)
+			if xhttp.UplinkHTTPMethod != "OPTIONS" {
+				t.Fatalf("Xray uplink method = %q, want OPTIONS", xhttp.UplinkHTTPMethod)
+			}
+			var h2Params struct{ MaxConcurrentStreams int }
+			if err := json.Unmarshal(xhttp.H2Params, &h2Params); err != nil || h2Params.MaxConcurrentStreams != 128 {
+				t.Fatalf("Xray HTTP/2 parameters = %s, error = %v", xhttp.H2Params, err)
 			}
 			second, _ := json.Marshal(buildConfig(testKernelCfg, node, testUsers, kernel.TLSCert{}))
 			if !bytes.Equal(data, second) {
