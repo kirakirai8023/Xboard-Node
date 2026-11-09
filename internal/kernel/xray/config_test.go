@@ -9,6 +9,7 @@ import (
 	"encoding/pem"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/kirakirai8023/Xboard-Node/internal/config"
@@ -16,7 +17,9 @@ import (
 	"github.com/kirakirai8023/Xboard-Node/internal/model"
 	"github.com/kirakirai8023/Xboard-Node/internal/panel"
 	"github.com/xtls/xray-core/app/proxyman"
+	xraylog "github.com/xtls/xray-core/common/log"
 	"github.com/xtls/xray-core/infra/conf/serial"
+	"github.com/xtls/xray-core/proxy/freedom"
 	"github.com/xtls/xray-core/transport/internet/splithttp"
 )
 
@@ -491,11 +494,89 @@ func TestBuildConfig_LogLevel(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.input, func(t *testing.T) {
-			result := xrayLogLevel(tc.input)
-			if result != tc.expected {
-				t.Errorf("xrayLogLevel(%q) = %q, want %q", tc.input, result, tc.expected)
+			cfg := buildConfig(config.KernelConfig{LogLevel: tc.input}, &model.NodeSpec{Protocol: "vless", ServerPort: 443}, testUsers, kernel.TLSCert{})
+			if result := cfg["log"].(M)["logLevel"]; result != tc.expected {
+				t.Fatalf("generated logLevel = %v, want %q", result, tc.expected)
+			}
+			data, err := json.Marshal(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := serial.LoadJSONConfig(bytes.NewReader(data)); err != nil {
+				t.Fatalf("Xray rejected generated log configuration: %v", err)
 			}
 		})
+	}
+}
+
+func TestBuildConfig_FreedomFinalRules(t *testing.T) {
+	for _, source := range []string{"panel", "local", "native_file"} {
+		for _, tc := range []struct {
+			name    string
+			rule    M
+			wantErr string
+		}{
+			{"delay_and_log_level", M{"action": "block", "delay": "1-2", "logLevel": "none"}, ""},
+			{"legacy_block_delay", M{"action": "block", "blockDelay": "1-2", "logLevel": "none"}, ""},
+			{"allow_with_delay", M{"action": "allow", "delay": 0}, "only supported for block finalRules"},
+			{"allow_with_log_level", M{"action": "allow", "logLevel": "none"}, "only supported for block finalRules"},
+			{"invalid_log_level", M{"action": "block", "logLevel": "invalid"}, "unknown finalRules.logLevel"},
+		} {
+			t.Run(source+"/"+tc.name, func(t *testing.T) {
+				node := &model.NodeSpec{Protocol: "vless", ServerPort: 443}
+				kcfg := testKernelCfg
+				settings := M{"finalRules": []M{tc.rule}}
+				outbound := M{"tag": "final-rules", "protocol": "freedom", "settings": settings}
+				switch source {
+				case "panel":
+					node.CustomOutbounds = []model.OutboundConfig{{Tag: "final-rules", Protocol: "freedom", Settings: settings}}
+				case "local":
+					kcfg.CustomOutbound = []map[string]any{outbound}
+				case "native_file":
+					kcfg.CustomConfig = filepath.Join(t.TempDir(), "custom.json")
+					data, err := json.Marshal(M{"outbounds": []M{outbound}})
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(kcfg.CustomConfig, data, 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				data, err := marshalConfig(kcfg, node, testUsers, kernel.TLSCert{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				pb, err := serial.LoadJSONConfig(bytes.NewReader(data))
+				if tc.wantErr != "" {
+					if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+						t.Fatalf("configuration error = %v, want %q", err, tc.wantErr)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("Xray rejected custom finalRules: %v", err)
+				}
+				for _, ob := range pb.Outbound {
+					if ob.Tag != "final-rules" {
+						continue
+					}
+					instance, err := ob.ProxySettings.GetInstance()
+					if err != nil {
+						t.Fatal(err)
+					}
+					rules := instance.(*freedom.Config).FinalRules
+					if len(rules) != 1 {
+						t.Fatalf("custom finalRules were lost: %v", rules)
+					}
+					rule := rules[0]
+					if rule.Action != freedom.RuleAction_Block || rule.Delay == nil || rule.Delay.Min != 1 || rule.Delay.Max != 2 || rule.LogLevel == nil || *rule.LogLevel != xraylog.Severity_Unknown {
+						t.Fatalf("parsed finalRule = %v", rule)
+					}
+					return
+				}
+				t.Fatal("custom outbound was lost")
+			})
+		}
 	}
 }
 

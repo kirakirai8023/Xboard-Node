@@ -122,7 +122,7 @@ func TestXray_XHTTPThroughCDN(t *testing.T) {
 				cdnFingerprint := sha256.Sum256(cdn.Certificate().Raw)
 				clientPort := unusedPort(t)
 				clientConfig := map[string]any{
-					"log":      map[string]any{"loglevel": "error"},
+					"log":      map[string]any{"logLevel": "error"},
 					"inbounds": []map[string]any{{"listen": "127.0.0.1", "port": clientPort, "protocol": "socks", "settings": map[string]any{"auth": "noauth"}}},
 					"outbounds": []map[string]any{{"protocol": "vless", "settings": map[string]any{"vnext": []map[string]any{
 						{"address": "127.0.0.1", "port": cdnPort, "users": []map[string]any{{"id": user.UUID, "encryption": "none"}}},

@@ -103,7 +103,7 @@ make build-all         # Cross-compile for Linux amd64 and arm64
 
 Traffic integration tests use the `integration` build tag and run in a separate CI step. Use an isolated host without Xray/TUN interception. Tests allow Xray private-network egress only to the local test target. Regular `make test` runs do not start these proxy listeners.
 
-Dependencies pin official sing-box `v1.14.4` and [Xray v26.10.31](https://github.com/XTLS/Xray-core/releases/tag/v26.10.31), release commit `a4a3dff5b20c2faae567b742c172c7b95e75c083`. Go resolves Xray to `v1.260327.1-0.20261031132019-a4a3dff5b20c`; the prefix follows Go module versioning rules. Neither kernel uses a fork replacement.
+Dependencies pin official sing-box `v1.14.4` and [Xray v26.11.9](https://github.com/XTLS/Xray-core/releases/tag/v26.11.9), release commit `676eaf66f8f05d4d558ee7a74b4736623d3feeb9`. Go resolves Xray to `v1.260327.1-0.20261109052709-676eaf66f8f0`; the prefix follows Go module versioning rules. Neither kernel uses a fork replacement.
 
 Security dependency minimums are `github.com/go-jose/go-jose/v4 v4.1.6` (RSA JWK denial of service, JSON parsing crashes, and CBC-HMAC panics) and `github.com/cilium/ebpf v0.22.0` (integer overflow when parsing BTF metadata). Preserve these minimums when updating transitive dependencies; see [CHANGELOG.md](CHANGELOG.md) for the security advisories.
 

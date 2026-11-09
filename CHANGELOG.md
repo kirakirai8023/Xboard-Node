@@ -10,6 +10,8 @@
 
 ### Changed
 
+- Upgrade the official Xray kernel from v26.10.31 to [v26.11.9](https://github.com/XTLS/Xray-core/releases/tag/v26.11.9), pinned to release commit `676eaf66f8f05d4d558ee7a74b4736623d3feeb9` (`v1.260327.1-0.20261109052709-676eaf66f8f0`), and refresh its uTLS, REALITY, CPU detection, and Brotli dependencies.
+- Emit Xray's canonical `log.logLevel` field. Document freedom final rules' `blockDelay` to `delay` migration, block-only `delay`/`logLevel` validation, and the upstream mux concurrency change, with Chinese upgrade notes in the README.
 - Require Go 1.27.3 in go.mod, CI, and Docker builds to incorporate the standard-library security fixes through that release.
 - Correct main-branch installation paths, xbctl binding flags, routing precedence and alternative-match semantics, kernel-specific outbound settings and limitations, and local DNS-01 configuration and credential names.
 - Explain that the commented configuration example must be uncommented and populated before deployment.
@@ -21,7 +23,7 @@
 - Derive GHCR publishing tags from the lowercase repository name and use the fork's container image in deployment examples.
 - Document the fork-only contribution workflow and the release publishing requirements for install and upgrade commands.
 - Update direct and transitive dependencies and remove the sing-box and Xray fork replacements.
-- Use official sing-box v1.14.4 and pin Xray v26.10.31 to release commit `a4a3dff5b20c2faae567b742c172c7b95e75c083` (`v1.260327.1-0.20261031132019-a4a3dff5b20c`), with refreshed module checksums and the dependency license link.
+- Use official sing-box v1.14.4 and Xray modules, with refreshed module checksums and dependency license links.
 - Adapt the sing-box lifecycle to upstream APIs: rebuild instances for credential or configuration changes, preserve cumulative traffic counters, keep connections open for limit-only updates, and attempt to restore the previous configuration if startup fails.
 - Move Xray per-user rate limiting into the local dispatcher, sharing token buckets across each user's connections and preserving the concrete pipe reader types required by mux/XUDP.
 - Remove Mieru from the advertised sing-box inbound and outbound protocol lists.
@@ -32,6 +34,7 @@
 
 ### Added
 
+- Verify freedom final rules through panel, local, and native-file configuration paths using Xray's JSON parser, including the new protobuf fields, deprecated alias, and invalid-rule rejection. Exercise concurrent TCP and UDP mux streams through the local rate limiter using memory pipes.
 - Add Chinese and English Xray upgrade notes, verify that XHTTP OPTIONS uploads and `h2Params` survive configuration conversion without changing the panel snapshot, and exercise POST/OPTIONS uploads through a local CDN proxy with HTTP and HTTPS origins.
 - Add a Linux integration regression that checks the listener's socket protocol with and without socket options, even when Go's MPTCP default is enabled; include it in `make test-integration` and the existing CI integration step.
 - Add full MPL-2.0 and AGPL-3.0 license texts, SPDX source headers, and a licensing overview that identifies the initial AGPL-only files.

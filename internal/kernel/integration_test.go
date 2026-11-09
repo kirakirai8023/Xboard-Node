@@ -328,7 +328,7 @@ func TestXray_RealityVisionUnlimited(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer server.Stop()
-			clientConfig := map[string]any{"log": map[string]any{"loglevel": "error"},
+			clientConfig := map[string]any{"log": map[string]any{"logLevel": "error"},
 				"inbounds": []map[string]any{{"listen": "127.0.0.1", "port": clientPort, "protocol": "socks", "settings": map[string]any{"auth": "noauth"}}},
 				"outbounds": []map[string]any{{"protocol": "vless", "settings": map[string]any{"vnext": []map[string]any{{"address": "127.0.0.1", "port": serverPort, "users": []map[string]any{{"id": user.UUID, "flow": "xtls-rprx-vision", "encryption": "none"}}}}},
 					"streamSettings": map[string]any{"network": "tcp", "security": "reality", "realitySettings": map[string]any{"serverName": "example.com", "fingerprint": "chrome", "password": base64.RawURLEncoding.EncodeToString(private.PublicKey().Bytes()), "shortId": "0123456789abcdef"}}}}}

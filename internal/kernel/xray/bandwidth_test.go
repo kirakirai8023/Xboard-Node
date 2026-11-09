@@ -6,11 +6,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/mux"
 	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
@@ -148,6 +150,83 @@ func TestLimitDispatcherMemoryPipes(t *testing.T) {
 			case <-ctx.Done():
 				t.Fatal(ctx.Err())
 			}
+		})
+	}
+}
+
+// Exercise upstream mux framing and concurrent writers through our limiter
+// using only memory pipes, without opening proxy listeners on the test host.
+func TestLimitDispatcher_MuxConcurrentStreams(t *testing.T) {
+	for _, network := range []xnet.Network{xnet.Network_TCP, xnet.Network_UDP} {
+		t.Run(network.String(), func(t *testing.T) {
+			const streams = 8
+			email := userEmail(1)
+			ld := newTestDispatcher()
+			ld.UpdateLimits(map[string]int{email: 1}, nil, nil)
+			ld.UpdateSpeedLimits(map[string]*rate.Limiter{email: rate.NewLimiter(1<<20, 1<<20)})
+			ld.innerDisp = memoryEchoDispatcher{seen: make(chan context.Context, streams)}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			t.Cleanup(cancel)
+			serverCtx := session.ContextWithInbound(ctx, &session.Inbound{
+				User:   &protocol.MemoryUser{Email: email},
+				Source: xnet.TCPDestination(xnet.LocalHostIP, 12345),
+			})
+			upR, upW := pipe.New(pipe.WithoutSizeLimit())
+			downR, downW := pipe.New(pipe.WithoutSizeLimit())
+			t.Cleanup(func() {
+				ld.Close()
+				common.Interrupt(upR)
+				common.Interrupt(upW)
+				common.Interrupt(downR)
+				common.Interrupt(downW)
+			})
+			server, err := mux.NewServerWorker(serverCtx, ld, &transport.Link{Reader: upR, Writer: downW})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { server.Close() })
+			client, err := mux.NewClientWorker(transport.Link{Reader: downR, Writer: upW}, mux.ClientStrategy{MaxConcurrency: streams})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { client.Close() })
+			t.Run("streams", func(t *testing.T) {
+				for i := range streams {
+					t.Run(strconv.Itoa(i), func(t *testing.T) {
+						t.Parallel()
+						inR, inW := pipe.New(pipe.WithoutSizeLimit())
+						outR, outW := pipe.New(pipe.WithoutSizeLimit())
+						defer common.Interrupt(inR)
+						defer common.Interrupt(inW)
+						defer common.Interrupt(outR)
+						defer common.Interrupt(outW)
+						clientCtx := session.ContextWithOutbounds(ctx, []*session.Outbound{{
+							Target: xnet.Destination{Network: network, Address: xnet.DomainAddress("example.com"), Port: 443},
+						}})
+						if !client.Dispatch(clientCtx, &transport.Link{Reader: inR, Writer: outW}) {
+							t.Fatal("mux rejected a stream")
+						}
+						payload := bytes.Repeat([]byte{byte(i + 1)}, 1024)
+						b := buf.New()
+						_, _ = b.Write(payload)
+						if err := inW.WriteMultiBuffer(buf.MultiBuffer{b}); err != nil {
+							t.Fatal(err)
+						}
+						response, err := outR.ReadMultiBufferTimeout(3 * time.Second)
+						if err != nil {
+							t.Fatalf("mux response: %v", err)
+						}
+						defer buf.ReleaseMulti(response)
+						var got bytes.Buffer
+						for _, b := range response {
+							_, _ = got.Write(b.Bytes())
+						}
+						if !bytes.Equal(got.Bytes(), payload) {
+							t.Fatal("mux mixed or corrupted stream payloads")
+						}
+					})
+				}
+			})
 		})
 	}
 }

@@ -48,7 +48,7 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 
 	cfg := M{
 		"log": M{
-			"loglevel": xrayLogLevel(kcfg.LogLevel),
+			"logLevel": xrayLogLevel(kcfg.LogLevel),
 			"error":    "",
 			"access":   "",
 		},
